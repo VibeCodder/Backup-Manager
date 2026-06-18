@@ -1446,44 +1446,351 @@ class ControlPanel(tk.Toplevel):
             return False, str(e)
 
     def _eject_windows(self, path):
-        """Windows: use mountvol to dismount, then DeviceIoControl via PowerShell."""
+        """Windows: safe removal for ALL USB drive types.
+
+        Strategy (tried in order):
+          1. cfgmgr32 CM_RequestDeviceEject via ctypes — the exact mechanism used by
+             Windows 'Safely Remove Hardware' tray. Pure Python, no PowerShell compile.
+             Works for ALL USB types including USB-SATA bridges (RTL9210, JMS578, etc.).
+          2. mountvol /d — last resort, filesystem-only dismount, no USB signal.
+        """
         drive_letter = os.path.splitdrive(path)[0]  # e.g. "E:"
         if not drive_letter:
             return False, "Could not determine drive letter"
-        # Try PowerShell-based safe removal (works for USB drives)
-        ps_script = (
-            "$vol = (Get-WmiObject Win32_Volume | Where-Object {$_.DriveLetter -eq '"
-            + drive_letter + "'});"
-            "if($vol){$vol.Dismount($false,$false)} else {'notfound'}"
-        )
+
+        # ── Method 1: CM_RequestDeviceEject via ctypes ───────────────────────
+        # Pure Python call into cfgmgr32.dll — the same API that the Windows
+        # 'Safely Remove Hardware' tray icon uses. No PowerShell, no C# compile.
+        # Works for ALL USB types: flash drives, USB-SATA bridges (RTL9210 etc.),
+        # card readers, and any other device Windows exposes via the PnP tree.
+        try:
+            import ctypes
+            import ctypes.wintypes
+            import struct
+
+            kernel32  = ctypes.windll.kernel32
+            cfgmgr32  = ctypes.windll.cfgmgr32
+
+            GENERIC_READ            = 0x80000000
+            GENERIC_WRITE           = 0x40000000
+            FILE_SHARE_READ         = 0x00000001
+            FILE_SHARE_WRITE        = 0x00000002
+            OPEN_EXISTING           = 3
+            IOCTL_STORAGE_GET_DEVICE_NUMBER     = 0x002D1080
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+            FSCTL_LOCK_VOLUME       = 0x00090018
+            FSCTL_DISMOUNT_VOLUME   = 0x00090020
+            INVALID_HANDLE          = ctypes.wintypes.HANDLE(-1).value
+
+            # ── Step A: resolve physical disk number from drive letter ──
+            vol_handle = kernel32.CreateFileW(
+                f"\\\\.\\{drive_letter}",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None, OPEN_EXISTING, 0, None
+            )
+            if vol_handle == INVALID_HANDLE:
+                # Try read-only — sufficient for IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
+                vol_handle = kernel32.CreateFileW(
+                    f"\\\\.\\{drive_letter}",
+                    GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None, OPEN_EXISTING, 0, None
+                )
+            if vol_handle == INVALID_HANDLE:
+                raise OSError(f"Cannot open volume handle for {drive_letter}")
+
+            buf = ctypes.create_string_buffer(512)
+            br  = ctypes.c_ulong(0)
+            disk_number = None
+
+            # IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS is more reliable than
+            # IOCTL_STORAGE_GET_DEVICE_NUMBER for multi-partition disks
+            if kernel32.DeviceIoControl(
+                vol_handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                None, 0, buf, 512, ctypes.byref(br), None
+            ):
+                # VOLUME_DISK_EXTENTS: DWORD NumberOfDiskExtents (4 bytes),
+                # then DISK_EXTENT[0]: DiskNumber (DWORD, 4 bytes) at offset 8
+                # (4 bytes padding for alignment after the DWORD count)
+                disk_number = struct.unpack_from("<I", buf, 8)[0]
+            else:
+                # Fallback: IOCTL_STORAGE_GET_DEVICE_NUMBER
+                # Returns STORAGE_DEVICE_NUMBER: Type(4), Number(4), Partition(4)
+                if kernel32.DeviceIoControl(
+                    vol_handle, IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                    None, 0, buf, 512, ctypes.byref(br), None
+                ):
+                    disk_number = struct.unpack_from("<I", buf, 4)[0]
+
+            # Lock + dismount the volume so OS releases open handles
+            kernel32.DeviceIoControl(vol_handle, FSCTL_LOCK_VOLUME,
+                                     None, 0, None, 0, ctypes.byref(br), None)
+            kernel32.DeviceIoControl(vol_handle, FSCTL_DISMOUNT_VOLUME,
+                                     None, 0, None, 0, ctypes.byref(br), None)
+            kernel32.CloseHandle(vol_handle)
+
+            if disk_number is None:
+                raise OSError("Could not resolve physical disk number")
+
+            # ── Step B: get PnP Device ID for PhysicalDriveN via WMI ──
+            # Use PowerShell WMI query (single fast line, no Add-Type needed)
+            ps_wmi = (
+                f"(Get-WmiObject Win32_DiskDrive | "
+                f"Where-Object {{$_.Index -eq {disk_number}}}).PNPDeviceID"
+            )
+            wmi_result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_wmi],
+                capture_output=True, text=True, timeout=10
+            )
+            pnp_id = wmi_result.stdout.strip()
+            if not pnp_id:
+                raise OSError(f"WMI returned no PNPDeviceID for PhysicalDrive{disk_number}")
+
+            # ── Step C: locate PnP device node and walk up to USB parent ──
+            CM_LOCATE_DEVNODE_NORMAL = 0
+            CR_SUCCESS = 0
+
+            dev_inst = ctypes.c_ulong(0)
+            ret = cfgmgr32.CM_Locate_DevNodeW(
+                ctypes.byref(dev_inst),
+                ctypes.c_wchar_p(pnp_id),
+                CM_LOCATE_DEVNODE_NORMAL
+            )
+            if ret != CR_SUCCESS:
+                raise OSError(f"CM_Locate_DevNodeW failed: CR={ret} for {pnp_id}")
+
+            # Walk up the device tree until we reach a node whose ID starts with USB\
+            # (the USB composite or hub parent — this is the node to eject)
+            MAX_DEVICE_ID_LEN = 200
+            for _ in range(12):
+                id_buf = ctypes.create_unicode_buffer(MAX_DEVICE_ID_LEN)
+                cfgmgr32.CM_Get_Device_IDW(
+                    dev_inst, id_buf, MAX_DEVICE_ID_LEN, 0
+                )
+                node_id = id_buf.value
+                if node_id.upper().startswith("USB\\"):
+                    # Found the USB device node — request safe eject
+                    veto_buf = ctypes.create_unicode_buffer(MAX_DEVICE_ID_LEN)
+                    cr = cfgmgr32.CM_Request_Device_EjectW(
+                        dev_inst,
+                        None,           # pVetoType — we don't need the veto type
+                        veto_buf,
+                        MAX_DEVICE_ID_LEN,
+                        0
+                    )
+                    if cr == CR_SUCCESS:
+                        return True, f"Ejected {drive_letter} via CM_Request_Device_Eject ({node_id})"
+                    veto = veto_buf.value
+                    raise OSError(
+                        f"CM_Request_Device_Eject CR={cr}"
+                        + (f" veto='{veto}'" if veto else "")
+                    )
+                # Go up one level in the PnP tree
+                parent = ctypes.c_ulong(0)
+                if cfgmgr32.CM_Get_Parent(
+                    ctypes.byref(parent), dev_inst, 0
+                ) != CR_SUCCESS:
+                    break
+                dev_inst = parent
+
+            raise OSError(f"No USB parent found in PnP tree for {pnp_id}")
+
+        except OSError as e:
+            last_error = str(e)
+        except Exception as e:
+            last_error = f"ctypes error: {e}"
+
+        # ── Method 2: mountvol /d — last resort ──────────────────────────────
+        # Filesystem-only dismount. Data is safe to remove, but Windows won't
+        # send a USB safe-removal signal — the tray icon stays until unplug.
+        try:
+            r = subprocess.run(
+                ["mountvol", drive_letter + "\\", "/d"],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.returncode == 0:
+                return True, f"Dismounted {drive_letter} via mountvol (no USB safe-removal signal)"
+            return False, f"cfgmgr32 failed ({last_error}); mountvol also failed: {r.stderr.strip() or 'unknown'}"
+        except FileNotFoundError:
+            return False, f"cfgmgr32 failed ({last_error}); mountvol not found"
+        except subprocess.TimeoutExpired:
+            return False, f"cfgmgr32 failed ({last_error}); mountvol timeout"
+        # This is the exact API that Windows 'Safely Remove Hardware' tray uses.
+        # It traverses the device tree, finds the USB parent node for the given
+        # drive letter, and requests its ejection — works for ALL USB drive types
+        # including USB-SATA bridge controllers (RTL9210, JMS578, ASMedia, etc.)
+        # that Windows marks as 'fixed' disks (invisible to Shell32 Eject).
+        ps_cmeject = f"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class UsbEject {{
+    [DllImport("setupapi.dll", CharSet=CharSet.Auto, SetLastError=true)]
+    public static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, string Enumerator,
+        IntPtr hwndParent, uint Flags);
+    [DllImport("setupapi.dll", SetLastError=true)]
+    public static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+    [DllImport("cfgmgr32.dll")]
+    public static extern uint CM_Get_Device_ID(uint dnDevInst, StringBuilder Buffer,
+        uint BufferLen, uint ulFlags);
+    [DllImport("cfgmgr32.dll")]
+    public static extern uint CM_Locate_DevNode(ref uint pdnDevInst, string pDeviceID,
+        uint ulFlags);
+    [DllImport("cfgmgr32.dll")]
+    public static extern uint CM_Get_Parent(ref uint pdnDevInst, uint dnDevInst,
+        uint ulFlags);
+    [DllImport("cfgmgr32.dll")]
+    public static extern uint CM_Request_Device_Eject(uint dnDevInst, IntPtr pVetoType,
+        StringBuilder pszVetoName, uint ulNameLength, uint ulFlags);
+    [DllImport("kernel32.dll", CharSet=CharSet.Auto, SetLastError=true)]
+    public static extern IntPtr CreateFile(string lpFileName, uint dwAccess,
+        uint dwShare, IntPtr lpSA, uint dwCreation, uint dwFlags, IntPtr hTemplate);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool DeviceIoControl(IntPtr hDevice, uint dwCode,
+        IntPtr lpIn, uint nIn, IntPtr lpOut, uint nOut,
+        ref uint lpBytesReturned, IntPtr lpOverlapped);
+    public static string EjectDrive(string driveLetter) {{
+        // Get DeviceNumber for the volume
+        string volPath = "\\\\\\\\.\\\\" + driveLetter;
+        IntPtr hVol = CreateFile(volPath, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (hVol == (IntPtr)(-1)) return "ERR:CannotOpenVolume";
+        byte[] outBuf = new byte[1024];
+        uint bytesRet = 0;
+        GCHandle gch = GCHandle.Alloc(outBuf, GCHandleType.Pinned);
+        bool ok = DeviceIoControl(hVol, 0x002D1400, IntPtr.Zero, 0,
+            gch.AddrOfPinnedObject(), (uint)outBuf.Length, ref bytesRet, IntPtr.Zero);
+        CloseHandle(hVol);
+        if (!ok) {{ gch.Free(); return "ERR:STORAGE_DEVICE_NUMBER failed"; }}
+        uint devNum = BitConverter.ToUInt32(outBuf, 4); // DeviceNumber offset
+        gch.Free();
+        // Find the disk device with matching DeviceNumber via WMI, get PNP ID
+        var searcher = new System.Management.ManagementObjectSearcher(
+            "SELECT * FROM Win32_DiskDrive WHERE Index=" + devNum);
+        string pnpId = null;
+        foreach (var mo in searcher.Get()) {{
+            pnpId = mo["PNPDeviceID"]?.ToString();
+            break;
+        }}
+        if (pnpId == null) return "ERR:PNPDeviceID not found for disk " + devNum;
+        // Locate the device node and walk up to the USB parent
+        uint devInst = 0;
+        if (CM_Locate_DevNode(ref devInst, pnpId, 0) != 0)
+            return "ERR:CM_Locate_DevNode failed for " + pnpId;
+        // Walk up until we find a USB parent (its ID starts with "USB\\")
+        for (int i = 0; i < 10; i++) {{
+            var sb = new StringBuilder(256);
+            CM_Get_Device_ID(devInst, sb, 256, 0);
+            if (sb.ToString().StartsWith("USB\\", StringComparison.OrdinalIgnoreCase)) {{
+                var veto = new StringBuilder(256);
+                uint res = CM_Request_Device_Eject(devInst, IntPtr.Zero, veto, 256, 0);
+                if (res == 0) return "OK:" + sb.ToString();
+                return "ERR:CM_Request_Device_Eject returned " + res + " veto=" + veto;
+            }}
+            uint parent = 0;
+            if (CM_Get_Parent(ref parent, devInst, 0) != 0) break;
+            devInst = parent;
+        }}
+        return "ERR:No USB parent found in device tree";
+    }}
+}}
+"@ -ReferencedAssemblies "System.Management"
+$result = [UsbEject]::EjectDrive("{drive_letter}")
+Write-Output $result
+"""
         try:
             result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=15
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmeject],
+                capture_output=True, text=True, timeout=30
             )
             out = result.stdout.strip()
-            if "notfound" in out.lower():
-                return False, f"Volume {drive_letter} not found via WMI"
-            if result.returncode == 0:
-                return True, f"Dismounted {drive_letter} via PowerShell"
-            # Fallback: mountvol /d
-            r2 = subprocess.run(
-                ["mountvol", drive_letter + "\\", "/d"],
-                capture_output=True, text=True, timeout=10
-            )
-            if r2.returncode == 0:
-                return True, f"Unmounted {drive_letter} via mountvol"
-            return False, result.stderr.strip() or "Unknown error"
+            if out.startswith("OK:"):
+                return True, f"Ejected {drive_letter} via CM_RequestDeviceEject ({out[3:]})"
+            # ERR from our script — fall through to method 2
         except FileNotFoundError:
-            # powershell not on PATH – try mountvol directly
-            r2 = subprocess.run(
+            pass  # PowerShell not on PATH
+        except subprocess.TimeoutExpired:
+            return False, "Timeout waiting for CM_RequestDeviceEject"
+
+        # ── Method 2: DeviceIoControl IOCTL_STORAGE_EJECT_MEDIA ──────────────
+        # Opens the physical disk handle (\\.\PhysicalDriveN) and sends eject.
+        # Works for removable USB and some bridge controllers, not for all fixed disks.
+        try:
+            import ctypes, ctypes.wintypes
+            kernel32 = ctypes.windll.kernel32
+            GENERIC_READ  = 0x80000000
+            GENERIC_WRITE = 0x40000000
+            FILE_SHARE_READ  = 0x00000001
+            FILE_SHARE_WRITE = 0x00000002
+            OPEN_EXISTING = 3
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
+            IOCTL_STORAGE_EJECT_MEDIA = 0x2D4808
+            FSCTL_LOCK_VOLUME     = 0x00090018
+            FSCTL_DISMOUNT_VOLUME = 0x00090020
+
+            # Step 1: get physical disk number from volume handle
+            vol_handle = kernel32.CreateFileW(
+                f"\\\\.\\{drive_letter}",
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None, OPEN_EXISTING, 0, None
+            )
+            INVALID = ctypes.wintypes.HANDLE(-1).value
+            disk_number = None
+            if vol_handle != INVALID:
+                buf = ctypes.create_string_buffer(512)
+                br  = ctypes.c_ulong(0)
+                if kernel32.DeviceIoControl(
+                    vol_handle, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                    None, 0, buf, 512, ctypes.byref(br), None
+                ):
+                    # Structure: DWORD NumberOfDiskExtents, then extents[0].DiskNumber (DWORD)
+                    disk_number = ctypes.cast(buf[4:8],
+                                              ctypes.POINTER(ctypes.c_ulong))[0]
+                # Lock + dismount volume before physical eject
+                kernel32.DeviceIoControl(vol_handle, FSCTL_LOCK_VOLUME,
+                                         None, 0, None, 0, ctypes.byref(br), None)
+                kernel32.DeviceIoControl(vol_handle, FSCTL_DISMOUNT_VOLUME,
+                                         None, 0, None, 0, ctypes.byref(br), None)
+                kernel32.CloseHandle(vol_handle)
+
+            # Step 2: open PhysicalDrive handle and send IOCTL_STORAGE_EJECT_MEDIA
+            if disk_number is not None:
+                phys_handle = kernel32.CreateFileW(
+                    f"\\\\.\\PhysicalDrive{disk_number}",
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None, OPEN_EXISTING, 0, None
+                )
+                if phys_handle != INVALID:
+                    br2 = ctypes.c_ulong(0)
+                    ok = kernel32.DeviceIoControl(
+                        phys_handle, IOCTL_STORAGE_EJECT_MEDIA,
+                        None, 0, None, 0, ctypes.byref(br2), None
+                    )
+                    kernel32.CloseHandle(phys_handle)
+                    if ok:
+                        return True, f"Ejected {drive_letter} via IOCTL_STORAGE_EJECT_MEDIA (PhysicalDrive{disk_number})"
+        except Exception:
+            pass
+
+        # ── Method 3: mountvol /d — last resort ──────────────────────────────
+        # Filesystem-only dismount. Data is safe but the OS won't send a USB
+        # safe-removal signal — the tray icon may remain until physical unplug.
+        try:
+            r = subprocess.run(
                 ["mountvol", drive_letter + "\\", "/d"],
                 capture_output=True, text=True, timeout=10
             )
-            return (r2.returncode == 0,
-                    f"mountvol {drive_letter}" if r2.returncode == 0 else r2.stderr.strip())
+            if r.returncode == 0:
+                return True, f"Dismounted {drive_letter} via mountvol (no USB safe-removal signal)"
+            return False, r.stderr.strip() or "All eject methods failed"
+        except FileNotFoundError:
+            return False, "No eject method available (PowerShell and mountvol not found)"
         except subprocess.TimeoutExpired:
-            return False, "Timeout waiting for eject"
+            return False, "Timeout waiting for mountvol"
 
     def _eject_linux(self, path):
         """Linux: try udisksctl power-off first, then umount+eudiscs or udisks."""
