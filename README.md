@@ -1,7 +1,9 @@
 
 ## First window (Main)
-<img width="1920" height="1020" alt="python_xh0TBKKr2y" src="https://github.com/user-attachments/assets/6ec3ee3f-096c-4fbe-a362-8bd2ef9d1344" />
+<img width="1920" height="1020" alt="python_uY7K44YS9P" src="https://github.com/user-attachments/assets/75f8df65-70b2-46ca-8993-d9a29ef61afc" />
+
 <br><br>
 
 ## Second window
-<img width="1920" height="1020" alt="python_bYxgGwYdjY" src="https://github.com/user-attachments/assets/73a22ffd-a432-490f-a30f-e16d8258c825" />
+<img width="1920" height="1020" alt="python_YiY2x6Knlm" src="https://github.com/user-attachments/assets/1dbfeacf-85b1-414d-a9da-63435d343093" />
+
