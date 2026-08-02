@@ -15,6 +15,7 @@ from pathlib import Path
 import time
 from datetime import datetime
 import json
+import queue
 
 # ── Try to import tkinterdnd2 (real DnD from Explorer) ──────────────────────
 # Auto-install if missing so user doesn't need to do anything manually.
@@ -370,6 +371,8 @@ class DrivePanel(tk.Frame):
         # root = the base path configured for this drive (e.g. E:\Kopie zapasowe)
         # relative_subpath = subfolder navigated into, relative to root (e.g. Dokumenty\Inne)
         self.relative_subpath = ""
+        self._avail_result_queue = queue.Queue()
+        self._avail_check_running = False
         self._build()
 
     def _build(self):
@@ -378,8 +381,10 @@ class DrivePanel(tk.Frame):
         header.pack(fill="x")
 
         dot_color = GREEN if (self.drive_path and os.path.exists(self.drive_path)) else RED
-        tk.Label(header, text="●", font=("Segoe UI", 14), fg=dot_color,
-                 bg=BG3).pack(side="left", padx=(8, 4))
+        self.dot_label = tk.Label(header, text="●", font=("Segoe UI", 14), fg=dot_color,
+                 bg=BG3)
+        self.dot_label.pack(side="left", padx=(8, 4))
+        self._available = bool(self.drive_path and os.path.exists(self.drive_path))
 
         self.title_var = tk.StringVar(value=f"Drive {self.drive_index + 1}")
         title_lbl = tk.Label(header, textvariable=self.title_var,
@@ -416,6 +421,9 @@ class DrivePanel(tk.Frame):
         self.status_bar.pack(fill="x", side="bottom")
 
         self._update_info()
+        # Start watching this drive for disconnects/reconnects so the file
+        # listing and green dot never go stale after a drive is unplugged.
+        self.after(1500, self._poll_availability)
 
     def choose_drive(self):
         path = filedialog.askdirectory(title=f"Select root folder for Drive {self.drive_index + 1}")
@@ -427,8 +435,71 @@ class DrivePanel(tk.Frame):
         self.relative_subpath = ""
         self.config["drives"][self.drive_index] = path
         save_config(self.config)
+        self._available = bool(path and os.path.exists(path))
+        self.dot_label.config(fg=GREEN if self._available else RED)
         self.file_tree.load(path)
         self._update_info()
+
+    def _poll_availability(self):
+        """Runs every ~1.5s ON THE MAIN THREAD, but never touches the disk
+        itself — that's delegated to a background worker (see
+        _availability_worker) because os.path.exists()/disk_usage() on a
+        drive letter that's mid-mount/spinning up can block for seconds on
+        Windows, which would otherwise freeze the whole UI."""
+        try:
+            while True:
+                exists, total, used, free = self._avail_result_queue.get_nowait()
+                self._apply_availability(exists, total, used, free)
+        except queue.Empty:
+            pass
+        if not self._avail_check_running:
+            self._avail_check_running = True
+            threading.Thread(target=self._availability_worker, daemon=True).start()
+        try:
+            self.after(1500, self._poll_availability)
+        except Exception:
+            pass  # widget destroyed
+
+    def _availability_worker(self):
+        """Background thread: all potentially-blocking disk I/O happens
+        here. Never touches Tk widgets directly — only pushes results
+        onto a thread-safe queue for the main thread to pick up."""
+        path = self.drive_path
+        exists = bool(path) and os.path.exists(path)
+        total = used = free = None
+        if exists:
+            total, used, free = get_drive_info(path)
+        try:
+            self._avail_result_queue.put((exists, total, used, free))
+        finally:
+            self._avail_check_running = False
+
+    def _apply_availability(self, exists, total, used, free):
+        """Runs on the main thread. Cheap — just updates widgets."""
+        if exists != self._available:
+            self._available = exists
+            if exists:
+                self.dot_label.config(fg=GREEN)
+                self.file_tree.load(self.drive_path)
+                self.set_status("✔ Reconnected", GREEN)
+            else:
+                self.dot_label.config(fg=RED)
+                self.file_tree.tree.delete(*self.file_tree.tree.get_children())
+                self.file_tree.path_var.set("")
+                self.set_status("✘ Disconnected", RED)
+        if exists and total:
+            pct = (used / total) * 100
+            self.progress["value"] = pct
+            self.info_label.config(
+                text=f"Free: {format_size(free)}  |  Used: {format_size(used)}  |  Total: {format_size(total)}",
+                fg=TEXT
+            )
+            short = os.path.splitdrive(self.drive_path)[0] or self.drive_path[:20]
+            self.title_var.set(f"Drive {self.drive_index + 1}  ({short})")
+        elif not exists:
+            self.info_label.config(text="— no drive —", fg=TEXT_DIM)
+            self.progress["value"] = 0
+            self.title_var.set(f"Drive {self.drive_index + 1}")
 
     def navigate_to_relative(self, rel_subpath):
         """Navigate this panel to drive_root / rel_subpath. Called by ControlPanel."""
@@ -460,10 +531,19 @@ class DrivePanel(tk.Frame):
         else:
             self.info_label.config(text="— no drive —", fg=TEXT_DIM)
             self.progress["value"] = 0
+            self.title_var.set(f"Drive {self.drive_index + 1}")
 
     def refresh(self):
         self._update_info()
-        self.file_tree.refresh()
+        if self.drive_path and os.path.exists(self.drive_path):
+            self._available = True
+            self.dot_label.config(fg=GREEN)
+            self.file_tree.refresh()
+        else:
+            self._available = False
+            self.dot_label.config(fg=RED)
+            self.file_tree.tree.delete(*self.file_tree.tree.get_children())
+            self.file_tree.path_var.set("")
 
     def set_status(self, msg, color=TEXT_DIM):
         self.status_var.set(msg)
@@ -583,6 +663,7 @@ class ControlPanel(tk.Toplevel):
         self.src_var = tk.StringVar(value=self.config.get("source_path", str(Path.home())))
         self.src_entry = tk.Entry(path_row, textvariable=self.src_var, font=FONT_MONO,
                                    bg=BG, fg=TEXT, insertbackground=TEXT,
+                                   readonlybackground=BG, disabledbackground=BG,
                                    relief="flat", bd=4)
         self.src_entry.pack(side="left", fill="x", expand=True)
         tk.Button(path_row, text="📂", command=self._choose_source,
@@ -631,6 +712,10 @@ class ControlPanel(tk.Toplevel):
         # Drop queue panel (replaces old tiny drop bar)
         self._build_drop_queue(right)
 
+        # Allow dragging items directly from the Control Panel file preview
+        # into the Drop Zone (same as dragging from Explorer)
+        self._setup_internal_drag()
+
         # ── Destination checkboxes ────────────
         dest_frame = tk.Frame(self, bg=BG2, pady=5, padx=12)
         dest_frame.pack(fill="x", padx=6, pady=(2, 0))
@@ -657,6 +742,9 @@ class ControlPanel(tk.Toplevel):
         self.copy_btn = styled_button(btn_frame, "📋  COPY SELECTED",
                                        self._copy_selected, GREEN)
         self.copy_btn.pack(side="left", padx=(0, 6))
+        self.move_btn = styled_button(btn_frame, "✂  MOVE SELECTED",
+                                       self._move_selected, "#f97316")
+        self.move_btn.pack(side="left", padx=(0, 6))
         styled_button(btn_frame, "🗑  DELETE from drives",
                       self._delete_selected, RED).pack(side="left", padx=(0, 6))
         styled_button(btn_frame, "🔄 SYNC folder",
@@ -1188,8 +1276,142 @@ class ControlPanel(tk.Toplevel):
         badge_text = f"{count} items" if count != 1 else "1 item"
         self.queue_badge.config(text=badge_text, bg=badge_color)
 
-        # Keep _selected_paths in sync so KOPIUJ always uses queue
+        # Keep _selected_paths in sync so COPY always uses queue
         self._selected_paths = list(self._queue_items)
+
+    # ══════════════════════════════════════════
+    # INTERNAL DRAG & DROP (Control Panel preview → Drop Zone)
+    # ══════════════════════════════════════════
+    def _setup_internal_drag(self):
+        """
+        Lets the user drag items straight out of the Control Panel's own
+        file preview (self.source_tree) and drop them onto the Drop Zone —
+        exactly like dragging from Windows Explorer, but internal to the app.
+        """
+        self._src_drag = {"pressed": False, "dragging": False}
+        tree = self.source_tree.tree
+        tree.bind("<ButtonPress-1>", self._src_drag_press, add="+")
+        tree.bind("<B1-Motion>", self._src_drag_motion, add="+")
+        tree.bind("<ButtonRelease-1>", self._src_drag_release, add="+")
+
+    def _src_drag_press(self, event):
+        tree = self.source_tree.tree
+        item = tree.identify_row(event.y)
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        selected = tree.selection()
+        # If the user pressed down on an item that's already part of a
+        # multi-selection (no Ctrl/Shift), defer Treeview's default behavior
+        # (which would otherwise instantly collapse the selection to just
+        # this item) until we know if this turns into a click or a drag —
+        # same as Explorer's "click-and-drag a multi-selection" behavior.
+        defer = bool(item) and not ctrl and not shift and item in selected and len(selected) > 1
+        self._src_drag = {
+            "pressed": True, "dragging": False,
+            "x": event.x_root, "y": event.y_root, "ghost": None, "paths": [],
+            "defer_item": item if defer else None,
+        }
+        if defer:
+            return "break"
+
+    def _src_drag_motion(self, event):
+        d = getattr(self, "_src_drag", None)
+        if not d or not d.get("pressed"):
+            return
+        block_default = bool(d.get("defer_item"))
+        if not d["dragging"]:
+            dx = abs(event.x_root - d["x"])
+            dy = abs(event.y_root - d["y"])
+            if dx < 8 and dy < 8:
+                return "break" if block_default else None
+            paths = self.source_tree.get_selected_paths()
+            if not paths:
+                return "break" if block_default else None
+            d["dragging"] = True
+            d["paths"] = paths
+            count = len(paths)
+            label = os.path.basename(paths[0]) if count == 1 else f"{count} items"
+            ghost = tk.Toplevel(self)
+            ghost.overrideredirect(True)
+            try:
+                ghost.attributes("-topmost", True)
+                ghost.attributes("-alpha", 0.88)
+            except Exception:
+                pass
+            tk.Label(ghost, text=f"📦  {label}", bg=ACCENT, fg=TEXT,
+                     font=FONT_BOLD, padx=10, pady=5).pack()
+            d["ghost"] = ghost
+
+        if d["dragging"] and d["ghost"] is not None:
+            try:
+                d["ghost"].geometry(f"+{event.x_root + 14}+{event.y_root + 10}")
+            except Exception:
+                pass
+            target = self._widget_under_point(event.x_root, event.y_root)
+            if self._is_drop_zone_widget(target):
+                self.drop_surface.config(highlightbackground=ACCENT, bg="#1a2540")
+                self.drop_placeholder.config(fg=ACCENT2, bg="#1a2540")
+                self.queue_listbox.config(bg="#1a2540")
+            else:
+                self._queue_reset_surface()
+        return "break" if block_default else None
+
+    def _src_drag_release(self, event):
+        d = getattr(self, "_src_drag", None)
+        if not d:
+            return
+        block_default = bool(d.get("defer_item"))
+        if d.get("dragging"):
+            target = self._widget_under_point(event.x_root, event.y_root)
+            if self._is_drop_zone_widget(target):
+                added = 0
+                for p in d.get("paths", []):
+                    if p and p not in self._queue_items:
+                        self._queue_items.append(p)
+                        added += 1
+                self._queue_refresh()
+                if added:
+                    self.log.log(
+                        f"⬇ Dragged {added} item(s) from Control Panel preview into Drop Zone",
+                        "info"
+                    )
+            self._queue_reset_surface()
+            if d.get("ghost") is not None:
+                try:
+                    d["ghost"].destroy()
+                except Exception:
+                    pass
+        elif block_default and d.get("defer_item"):
+            # It was just a plain click (no drag) on an item that was part of
+            # a multi-selection — now collapse the selection to that single
+            # item, mimicking the default behavior we suppressed on press.
+            tree = self.source_tree.tree
+            item = d["defer_item"]
+            tree.selection_set(item)
+            tree.focus(item)
+        self._src_drag = {"pressed": False, "dragging": False}
+        return "break" if block_default else None
+
+    def _widget_under_point(self, x_root, y_root):
+        try:
+            return self.winfo_containing(x_root, y_root)
+        except Exception:
+            return None
+
+    def _is_drop_zone_widget(self, widget):
+        if widget is None:
+            return False
+        w = widget
+        for _ in range(10):
+            if w is None:
+                return False
+            if w in (self.drop_surface, self.queue_listbox, self.drop_placeholder):
+                return True
+            try:
+                w = w.master
+            except Exception:
+                return False
+        return False
 
     # ══════════════════════════════════════════
     # DROP ZONE (old method kept as no-op for safety)
@@ -1312,6 +1534,115 @@ class ControlPanel(tk.Toplevel):
         self.copy_btn.config(state="normal")
         messagebox.showinfo("Done", "Copy completed successfully!")
 
+    def _move_selected(self):
+        if self._copying:
+            self.log.log("Operation in progress – please wait!", "warn")
+            return
+        # Priority: drop queue > tree selection (works from Explorer path,
+        # from a custom path, AND from any of the 4 drives selected as source)
+        if hasattr(self, '_queue_items') and self._queue_items:
+            paths = list(self._queue_items)
+        else:
+            paths = self._selected_paths
+        if not paths:
+            messagebox.showwarning("Nothing to move",
+                "Add files/folders to the Drop Zone\nor select them in the preview above.")
+            return
+        drives = self._get_active_drives()
+        if not drives:
+            messagebox.showerror("No drives", "No active destination drives.")
+            return
+        names = [os.path.basename(p) for p in paths]
+        msg = (f"Move {len(names)} item(s) to {len(drives)} drive(s)?\n\n"
+               + "\n".join(names[:8]))
+        if len(names) > 8:
+            msg += f"\n... and {len(names) - 8} more"
+        msg += "\n\n⚠ Original files will be REMOVED from the source after copying."
+        if not messagebox.askyesno("Confirm move", msg):
+            return
+        threading.Thread(target=self._do_move, args=(paths, drives), daemon=True).start()
+
+    def _do_move(self, src_paths, drives):
+        self._copying = True
+        self.copy_btn.config(state="disabled")
+        self.move_btn.config(state="disabled")
+        total = len(src_paths) * len(drives)
+        done = 0
+        failed_sources = set()
+        same_target_sources = set()
+        self.log.log(f"Moving: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
+        for drive_idx, drive_root in drives:
+            panel = self.drive_panels[drive_idx]
+            panel.set_status("⏳ Moving...", ORANGE)
+            rel = panel.relative_subpath
+            dest_folder = os.path.join(drive_root, rel) if rel else drive_root
+            os.makedirs(dest_folder, exist_ok=True)
+            for src in src_paths:
+                if not src:
+                    continue
+                name = os.path.basename(src)
+                dest = os.path.join(dest_folder, name)
+                # Moving a folder/file onto itself (source == destination drive/path) — skip copy step
+                try:
+                    same_target = os.path.exists(src) and os.path.exists(dest) and \
+                                  os.path.samefile(src, dest)
+                except Exception:
+                    same_target = False
+                try:
+                    if same_target:
+                        same_target_sources.add(src)
+                        self.log.log(f"↷ {name}: already on Drive {drive_idx+1}, skipping copy", "warn")
+                    elif os.path.isdir(src):
+                        if os.path.exists(dest):
+                            shutil.rmtree(dest)
+                        shutil.copytree(src, dest)
+                        self.log.log(f"✔ {name} → Drive {drive_idx+1}", "ok")
+                    else:
+                        shutil.copy2(src, dest)
+                        self.log.log(f"✔ {name} → Drive {drive_idx+1}", "ok")
+                except Exception as e:
+                    self.log.log(f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
+                    failed_sources.add(src)
+                done += 1
+                self.progress_var.set((done / total) * 100)
+            panel.set_status("✔ Done", GREEN)
+            panel.refresh()
+
+        # Remove originals — only for items that copied successfully to ALL drives
+        removed = 0
+        for src in src_paths:
+            if not src or src in failed_sources:
+                continue
+            if src in same_target_sources:
+                self.log.log(
+                    f"↷ Keeping source (already the copy on a destination drive): "
+                    f"{os.path.basename(src)}", "warn"
+                )
+                continue
+            try:
+                if os.path.isdir(src):
+                    shutil.rmtree(src)
+                else:
+                    os.remove(src)
+                removed += 1
+                self.log.log(f"✂ Removed source: {os.path.basename(src)}", "warn")
+            except Exception as e:
+                self.log.log(f"✘ Could not remove source {os.path.basename(src)}: {e}", "err")
+
+        # Clean up queue/selection, refresh views
+        if hasattr(self, '_queue_items'):
+            self._queue_items = [p for p in self._queue_items if p in failed_sources]
+            self._queue_refresh()
+        self._selected_paths = []
+        self.source_tree.refresh()
+
+        self.progress_var.set(100)
+        self.log.log(f"Move complete! {removed} item(s) moved.", "ok")
+        self._copying = False
+        self.copy_btn.config(state="normal")
+        self.move_btn.config(state="normal")
+        messagebox.showinfo("Done", "Move completed successfully!")
+
     def _delete_selected(self):
         paths = self._selected_paths
         if not paths:
@@ -1411,22 +1742,31 @@ class ControlPanel(tk.Toplevel):
         results = []
         for drive_idx, drive_path in drives:
             ok, detail = self._eject_drive(system, drive_path)
-            tag = "ok" if ok else "err"
-            status = "✔ Ejected" if ok else "✘ Failed"
+            # "mountvol only" = filesystem-dismount fallback, not a full USB
+            # safe-eject (see _eject_windows Method 3) — flag it distinctly
+            # instead of reporting it the same as a real safe-eject.
+            partial = ok and "mountvol only" in detail
+            tag = "warn" if partial else ("ok" if ok else "err")
+            status = "✔ Ejected" if ok and not partial else ("⚠ Dismounted only" if partial else "✘ Failed")
             self.log.log(f"⏏ Drive {drive_idx+1} {status}: {detail}", tag)
-            results.append((drive_idx, ok, detail))
+            results.append((drive_idx, ok, detail, partial))
 
         # Update panels that were successfully ejected
-        for drive_idx, ok, _ in results:
+        for drive_idx, ok, _, partial in results:
             panel = self.drive_panels[drive_idx]
-            if ok:
+            if ok and not partial:
                 panel.set_status("⏏ Ejected – safe to remove", "#22c55e")
+            elif ok and partial:
+                panel.set_status("⚠ Dismounted only – wait before unplugging", ORANGE)
             else:
                 panel.set_status("✘ Eject failed", "#ef4444")
 
-        success = sum(1 for _, ok, _ in results if ok)
-        fail    = len(results) - success
-        summary = f"Eject complete: {success} succeeded"
+        success = sum(1 for _, ok, _, partial in results if ok and not partial)
+        partial_count = sum(1 for _, ok, _, partial in results if ok and partial)
+        fail = len(results) - success - partial_count
+        summary = f"Eject complete: {success} fully ejected"
+        if partial_count:
+            summary += f", {partial_count} dismounted only (wait a few seconds before unplugging)"
         if fail:
             summary += f", {fail} failed (check log)"
         self.after(0, lambda: messagebox.showinfo("Safely Eject", summary))
@@ -1448,15 +1788,23 @@ class ControlPanel(tk.Toplevel):
     def _eject_windows(self, path):
         """Windows: safe removal for ALL USB drive types.
 
-        Strategy (tried in order):
+        Strategy (tried in order, each one only runs if the previous one failed):
           1. cfgmgr32 CM_RequestDeviceEject via ctypes — the exact mechanism used by
-             Windows 'Safely Remove Hardware' tray. Pure Python, no PowerShell compile.
-             Works for ALL USB types including USB-SATA bridges (RTL9210, JMS578, etc.).
-          2. mountvol /d — last resort, filesystem-only dismount, no USB signal.
+             Windows 'Safely Remove Hardware' tray. Works for ALL USB types including
+             USB-SATA bridges (RTL9210, JMS578, etc.).
+          2. DeviceIoControl IOCTL_STORAGE_EJECT_MEDIA on the physical disk handle —
+             a different code path than method 1, catches cases where the PnP-tree
+             walk in method 1 can't find a USB parent node.
+          3. mountvol /d — true last resort. Filesystem-only dismount: data is safe
+             (buffers are flushed), but Windows does NOT get a USB safe-removal
+             signal, so the tray icon may stay and the drive's own write cache
+             (if enabled) isn't guaranteed spun down before physical unplug.
         """
         drive_letter = os.path.splitdrive(path)[0]  # e.g. "E:"
         if not drive_letter:
             return False, "Could not determine drive letter"
+
+        last_error = "unknown error"
 
         # ── Method 1: CM_RequestDeviceEject via ctypes ───────────────────────
         # Pure Python call into cfgmgr32.dll — the same API that the Windows
@@ -1600,123 +1948,11 @@ class ControlPanel(tk.Toplevel):
         except Exception as e:
             last_error = f"ctypes error: {e}"
 
-        # ── Method 2: mountvol /d — last resort ──────────────────────────────
-        # Filesystem-only dismount. Data is safe to remove, but Windows won't
-        # send a USB safe-removal signal — the tray icon stays until unplug.
-        try:
-            r = subprocess.run(
-                ["mountvol", drive_letter + "\\", "/d"],
-                capture_output=True, text=True, timeout=10
-            )
-            if r.returncode == 0:
-                return True, f"Dismounted {drive_letter} via mountvol (no USB safe-removal signal)"
-            return False, f"cfgmgr32 failed ({last_error}); mountvol also failed: {r.stderr.strip() or 'unknown'}"
-        except FileNotFoundError:
-            return False, f"cfgmgr32 failed ({last_error}); mountvol not found"
-        except subprocess.TimeoutExpired:
-            return False, f"cfgmgr32 failed ({last_error}); mountvol timeout"
-        # This is the exact API that Windows 'Safely Remove Hardware' tray uses.
-        # It traverses the device tree, finds the USB parent node for the given
-        # drive letter, and requests its ejection — works for ALL USB drive types
-        # including USB-SATA bridge controllers (RTL9210, JMS578, ASMedia, etc.)
-        # that Windows marks as 'fixed' disks (invisible to Shell32 Eject).
-        ps_cmeject = f"""
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-public class UsbEject {{
-    [DllImport("setupapi.dll", CharSet=CharSet.Auto, SetLastError=true)]
-    public static extern IntPtr SetupDiGetClassDevs(ref Guid ClassGuid, string Enumerator,
-        IntPtr hwndParent, uint Flags);
-    [DllImport("setupapi.dll", SetLastError=true)]
-    public static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
-    [DllImport("cfgmgr32.dll")]
-    public static extern uint CM_Get_Device_ID(uint dnDevInst, StringBuilder Buffer,
-        uint BufferLen, uint ulFlags);
-    [DllImport("cfgmgr32.dll")]
-    public static extern uint CM_Locate_DevNode(ref uint pdnDevInst, string pDeviceID,
-        uint ulFlags);
-    [DllImport("cfgmgr32.dll")]
-    public static extern uint CM_Get_Parent(ref uint pdnDevInst, uint dnDevInst,
-        uint ulFlags);
-    [DllImport("cfgmgr32.dll")]
-    public static extern uint CM_Request_Device_Eject(uint dnDevInst, IntPtr pVetoType,
-        StringBuilder pszVetoName, uint ulNameLength, uint ulFlags);
-    [DllImport("kernel32.dll", CharSet=CharSet.Auto, SetLastError=true)]
-    public static extern IntPtr CreateFile(string lpFileName, uint dwAccess,
-        uint dwShare, IntPtr lpSA, uint dwCreation, uint dwFlags, IntPtr hTemplate);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool CloseHandle(IntPtr hObject);
-    [DllImport("kernel32.dll", SetLastError=true)]
-    public static extern bool DeviceIoControl(IntPtr hDevice, uint dwCode,
-        IntPtr lpIn, uint nIn, IntPtr lpOut, uint nOut,
-        ref uint lpBytesReturned, IntPtr lpOverlapped);
-    public static string EjectDrive(string driveLetter) {{
-        // Get DeviceNumber for the volume
-        string volPath = "\\\\\\\\.\\\\" + driveLetter;
-        IntPtr hVol = CreateFile(volPath, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
-        if (hVol == (IntPtr)(-1)) return "ERR:CannotOpenVolume";
-        byte[] outBuf = new byte[1024];
-        uint bytesRet = 0;
-        GCHandle gch = GCHandle.Alloc(outBuf, GCHandleType.Pinned);
-        bool ok = DeviceIoControl(hVol, 0x002D1400, IntPtr.Zero, 0,
-            gch.AddrOfPinnedObject(), (uint)outBuf.Length, ref bytesRet, IntPtr.Zero);
-        CloseHandle(hVol);
-        if (!ok) {{ gch.Free(); return "ERR:STORAGE_DEVICE_NUMBER failed"; }}
-        uint devNum = BitConverter.ToUInt32(outBuf, 4); // DeviceNumber offset
-        gch.Free();
-        // Find the disk device with matching DeviceNumber via WMI, get PNP ID
-        var searcher = new System.Management.ManagementObjectSearcher(
-            "SELECT * FROM Win32_DiskDrive WHERE Index=" + devNum);
-        string pnpId = null;
-        foreach (var mo in searcher.Get()) {{
-            pnpId = mo["PNPDeviceID"]?.ToString();
-            break;
-        }}
-        if (pnpId == null) return "ERR:PNPDeviceID not found for disk " + devNum;
-        // Locate the device node and walk up to the USB parent
-        uint devInst = 0;
-        if (CM_Locate_DevNode(ref devInst, pnpId, 0) != 0)
-            return "ERR:CM_Locate_DevNode failed for " + pnpId;
-        // Walk up until we find a USB parent (its ID starts with "USB\\")
-        for (int i = 0; i < 10; i++) {{
-            var sb = new StringBuilder(256);
-            CM_Get_Device_ID(devInst, sb, 256, 0);
-            if (sb.ToString().StartsWith("USB\\", StringComparison.OrdinalIgnoreCase)) {{
-                var veto = new StringBuilder(256);
-                uint res = CM_Request_Device_Eject(devInst, IntPtr.Zero, veto, 256, 0);
-                if (res == 0) return "OK:" + sb.ToString();
-                return "ERR:CM_Request_Device_Eject returned " + res + " veto=" + veto;
-            }}
-            uint parent = 0;
-            if (CM_Get_Parent(ref parent, devInst, 0) != 0) break;
-            devInst = parent;
-        }}
-        return "ERR:No USB parent found in device tree";
-    }}
-}}
-"@ -ReferencedAssemblies "System.Management"
-$result = [UsbEject]::EjectDrive("{drive_letter}")
-Write-Output $result
-"""
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmeject],
-                capture_output=True, text=True, timeout=30
-            )
-            out = result.stdout.strip()
-            if out.startswith("OK:"):
-                return True, f"Ejected {drive_letter} via CM_RequestDeviceEject ({out[3:]})"
-            # ERR from our script — fall through to method 2
-        except FileNotFoundError:
-            pass  # PowerShell not on PATH
-        except subprocess.TimeoutExpired:
-            return False, "Timeout waiting for CM_RequestDeviceEject"
-
         # ── Method 2: DeviceIoControl IOCTL_STORAGE_EJECT_MEDIA ──────────────
-        # Opens the physical disk handle (\\.\PhysicalDriveN) and sends eject.
-        # Works for removable USB and some bridge controllers, not for all fixed disks.
+        # Only reached if Method 1 failed. Opens the physical disk handle
+        # (\\.\PhysicalDriveN) directly and sends the storage-level eject —
+        # a different code path than the PnP-tree walk above, so it can
+        # succeed in cases where Method 1's USB-parent lookup fails.
         try:
             import ctypes, ctypes.wintypes
             kernel32 = ctypes.windll.kernel32
@@ -1773,24 +2009,37 @@ Write-Output $result
                     kernel32.CloseHandle(phys_handle)
                     if ok:
                         return True, f"Ejected {drive_letter} via IOCTL_STORAGE_EJECT_MEDIA (PhysicalDrive{disk_number})"
-        except Exception:
-            pass
+                    last_error = f"{last_error}; IOCTL_STORAGE_EJECT_MEDIA failed (PhysicalDrive{disk_number})"
+                else:
+                    last_error = f"{last_error}; could not open PhysicalDrive{disk_number}"
+            else:
+                last_error = f"{last_error}; could not resolve physical disk number"
+        except Exception as e:
+            last_error = f"{last_error}; IOCTL eject error: {e}"
 
-        # ── Method 3: mountvol /d — last resort ──────────────────────────────
-        # Filesystem-only dismount. Data is safe but the OS won't send a USB
-        # safe-removal signal — the tray icon may remain until physical unplug.
+        # ── Method 3: mountvol /d — true last resort ──────────────────────────
+        # Only reached if Methods 1 AND 2 both failed. Filesystem-only dismount:
+        # data is safe (buffers flushed), but Windows does NOT send a USB
+        # safe-removal signal, so the tray icon may stay and the drive's own
+        # write cache (if enabled) isn't guaranteed spun down before unplug.
+        # This is intentionally reported differently from a full eject so the
+        # UI/log don't claim a level of safety this method doesn't provide.
         try:
             r = subprocess.run(
                 ["mountvol", drive_letter + "\\", "/d"],
                 capture_output=True, text=True, timeout=10
             )
             if r.returncode == 0:
-                return True, f"Dismounted {drive_letter} via mountvol (no USB safe-removal signal)"
-            return False, r.stderr.strip() or "All eject methods failed"
+                return True, (
+                    f"Dismounted {drive_letter} via mountvol only — NOT a full safe-eject "
+                    f"({last_error}). Filesystem is safe to unplug, but wait a few seconds "
+                    f"for the drive to finish any pending writes before removing it."
+                )
+            return False, f"All eject methods failed ({last_error}); mountvol: {r.stderr.strip() or 'unknown error'}"
         except FileNotFoundError:
-            return False, "No eject method available (PowerShell and mountvol not found)"
+            return False, f"All eject methods failed ({last_error}); mountvol not found"
         except subprocess.TimeoutExpired:
-            return False, "Timeout waiting for mountvol"
+            return False, f"All eject methods failed ({last_error}); mountvol timeout"
 
     def _eject_linux(self, path):
         """Linux: try udisksctl power-off first, then umount+eudiscs or udisks."""
