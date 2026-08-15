@@ -704,6 +704,7 @@ class ControlPanel(tk.Toplevel):
                                      root_path=self.src_var.get(),
                                      on_select=self._on_source_select)
         self.source_tree.tree.bind("<Double-1>", self._on_source_navigate, add="+")
+        self.source_tree.tree.bind("<Button-3>", self._source_context_menu)
         self._orig_go_up = self.source_tree.go_up
         self.source_tree.go_up = self._go_up_synced
         self._patch_source_tree_toolbar()
@@ -1434,6 +1435,126 @@ class ControlPanel(tk.Toplevel):
         """Tree selection — updates _selected_paths only when queue is empty."""
         if not hasattr(self, '_queue_items') or not self._queue_items:
             self._selected_paths = paths
+
+    def _source_context_menu(self, event):
+        """Right-click on the source tree: Rename (single item) / Remove (any selection).
+        Both actions apply to the selected item(s) AND their counterparts on all
+        active destination drives."""
+        tree = self.source_tree.tree
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        # If the right-clicked row isn't part of the current selection, select just it.
+        if item not in tree.selection():
+            tree.selection_set(item)
+        paths = self.source_tree.get_selected_paths()
+        if not paths:
+            return
+        menu = tk.Menu(self, tearoff=0, bg=BG2, fg=TEXT,
+                        activebackground=ACCENT, activeforeground=TEXT,
+                        relief="flat", bd=0)
+        if len(paths) == 1:
+            menu.add_command(label="✎  Rename", command=self._source_rename_selected)
+            menu.add_separator()
+        menu.add_command(label="✕  Remove", command=self._source_remove_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _source_rename_selected(self):
+        """Rename the single selected source item, then rename its counterpart
+        (matched by old name) on every active destination drive."""
+        paths = self.source_tree.get_selected_paths()
+        if len(paths) != 1:
+            return
+        src = paths[0]
+        old_name = os.path.basename(src)
+        new_name = self._ask_name("New name", old_name)
+        if not new_name or new_name == old_name:
+            return
+        parent_dir = os.path.dirname(src)
+        new_src = os.path.join(parent_dir, new_name)
+        if os.path.exists(new_src):
+            messagebox.showerror("Rename", f"'{new_name}' already exists in this folder.")
+            return
+        try:
+            os.rename(src, new_src)
+            self.log.log(f"✎ Renamed source: {old_name} → {new_name}", "ok")
+        except Exception as e:
+            self.log.log(f"✘ Rename error (source) {old_name}: {e}", "err")
+            messagebox.showerror("Rename", f"Could not rename source item:\n{e}")
+            return
+
+        for drive_idx, drive_root in self._get_active_drives():
+            panel = self.drive_panels[drive_idx]
+            rel = panel.relative_subpath
+            dest_folder = os.path.join(drive_root, rel) if rel else drive_root
+            old_target = os.path.join(dest_folder, old_name)
+            new_target = os.path.join(dest_folder, new_name)
+            if os.path.exists(old_target):
+                try:
+                    if os.path.exists(new_target):
+                        if os.path.isdir(new_target):
+                            shutil.rmtree(new_target)
+                        else:
+                            os.remove(new_target)
+                    os.rename(old_target, new_target)
+                    self.log.log(f"✎ Renamed on Drive {drive_idx+1}: {old_name} → {new_name}", "ok")
+                except Exception as e:
+                    self.log.log(f"✘ Rename error on Drive {drive_idx+1}: {e}", "err")
+            panel.refresh()
+
+        self._selected_paths = []
+        self.source_tree.refresh()
+
+    def _source_remove_selected(self):
+        """Remove the selected item(s) from the source folder AND from every
+        active destination drive (matched by name)."""
+        paths = self.source_tree.get_selected_paths()
+        if not paths:
+            return
+        drives = self._get_active_drives()
+        names = [os.path.basename(p) for p in paths]
+        msg = f"Remove {len(names)} item(s)?\n\n" + "\n".join(names[:8])
+        if len(names) > 8:
+            msg += f"\n... and {len(names) - 8} more"
+        msg += "\n\n⚠ This deletes them from the source folder"
+        msg += f" and from {len(drives)} active drive(s)." if drives else "."
+        if not messagebox.askyesno("Confirm remove", msg):
+            return
+
+        removed = 0
+        for src in paths:
+            name = os.path.basename(src)
+            try:
+                if os.path.isdir(src):
+                    shutil.rmtree(src)
+                elif os.path.isfile(src):
+                    os.remove(src)
+                removed += 1
+                self.log.log(f"🗑 {name} removed from source", "warn")
+            except Exception as e:
+                self.log.log(f"✘ Remove error {name} (source): {e}", "err")
+
+            for drive_idx, drive_root in drives:
+                panel = self.drive_panels[drive_idx]
+                rel = panel.relative_subpath
+                dest_folder = os.path.join(drive_root, rel) if rel else drive_root
+                target = os.path.join(dest_folder, name)
+                try:
+                    if os.path.isdir(target):
+                        shutil.rmtree(target)
+                        self.log.log(f"🗑 {name} removed from Drive {drive_idx+1}", "warn")
+                    elif os.path.isfile(target):
+                        os.remove(target)
+                        self.log.log(f"🗑 {name} removed from Drive {drive_idx+1}", "warn")
+                except Exception as e:
+                    self.log.log(f"✘ Remove error {name} on Drive {drive_idx+1}: {e}", "err")
+
+        for drive_idx, _ in drives:
+            self.drive_panels[drive_idx].refresh()
+
+        self._selected_paths = []
+        self.source_tree.refresh()
+        self.log.log(f"Remove complete: {removed} item(s) removed.", "ok")
 
     def _choose_source(self):
         path = filedialog.askdirectory(title="Select source folder")
