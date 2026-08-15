@@ -39,11 +39,23 @@ except ImportError:
 # ─────────────────────────────────────────────
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".backup_manager_config.json")
 
+# Total drive slots supported. First MAIN_DRIVES are shown in the main window;
+# the rest (up to NUM_DRIVES) live in the secondary "More Drives" window.
+NUM_DRIVES  = 8
+MAIN_DRIVES = 4
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"drives": ["", "", "", ""], "source_path": str(Path.home()), "window_positions": {}}
+            cfg = json.load(f)
+    else:
+        cfg = {"drives": [], "source_path": str(Path.home()), "window_positions": {}}
+    # Migrate/pad older configs (which may only have 4 drive slots) up to NUM_DRIVES.
+    drives = cfg.get("drives", [])
+    if len(drives) < NUM_DRIVES:
+        drives = drives + [""] * (NUM_DRIVES - len(drives))
+    cfg["drives"] = drives[:NUM_DRIVES]
+    return cfg
 
 def save_config(cfg):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -68,6 +80,27 @@ FONT_BOLD   = ("Segoe UI", 10, "bold")
 FONT_TITLE  = ("Segoe UI", 13, "bold")
 FONT_SMALL  = ("Segoe UI", 8)
 FONT_MONO   = ("Consolas", 9)
+
+# ── "New folder" toolbar icon (flat folder + green "+" badge, 20x20 PNG) ──
+NEW_FOLDER_ICON_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAYAAACNiR0NAAADN0lEQVR4nKWUS2gkZRSFv3v/"
+    "v6rT3XnS4yRkMTIwAVEYdCEoCM4ggquACxGU+JrZiAuXgiA9vXSpLgRBNItZOIoKuvCxiQsR"
+    "3agTRMQHPsZRwph3d6frca+L7iRtTAbBA1U/VFHnnnPurSsMw104CAEQ/9fz/4dDCh0BGVwO"
+    "8OT7PrWxsftqg4kTE7x8F+uIeLPp2rrA4Upl34E0m01dOnNBT/6evxkqyd1lLzMEBTFNgpZ5"
+    "8W1lLL33lXnpHKWq2XRttcR2FbKw6I0Qsz9DkkYvfTc33CFEyHc6d+Za+y4UaBmxXaIJoFPD"
+    "F++X9WHLPHDJ03qWL4c0zJVZYYAOpec4WyL7RD64C2IxTcl72VudNH3q5m8GYT/xro9ZO/te"
+    "YzJtee6I/KMJohGRXSIDBPV+Tdd+eenuzL36SPWHCLCVkdShekTkeJm7iSMuREsxgV7YAMGT"
+    "bEzU1RMZCXhTI0CS44PShxMKEjzFpODXqQ9YqX9BN67gGCPFMY73btfR9ZOKtEwAHrroUynZ"
+    "TxqSSSsOWnbUI1lYZ3n6RVZrl1FPUY/9ADx3KhCsuuylL8SjVA0liEnO8vRLrNYuUymmMDEC"
+    "gAgliUjXXcbiaWtnH+r1qBwjWsLV8SVWa19TKaYoJSeIsG07bBZtogiuLradmYQwc13Cvjpn"
+    "pf45aikuRpTA1d415o/dwbnZ+7jSu0YQBRH1wnzPsoOBD/rcP9WDZLrl3bgiSkQFtssuD8/c"
+    "w/OnzlMPIwC8/sdH1EIFw0UBkgwXqInooBkqIAIC4uKY7yl2p5GMU9WUKIHj6SQ+NG+x6a4t"
+    "2Hj0IosS7Tw5gCmImBQk5Sg1n5E1+cvMoo7HGi/89jYK3JBO8uyPrzFbaWBu4P0/ZW/bnLvU"
+    "PeWMBHo9ADphLdbKmeKzE08/njfaz5RrWS4qSRClXe5g7ozFKqUbmDtBh+bNXYbX0DCmvzpd"
+    "r3Vu+zKMJnPlZi8XkaT/qQyUeSnVJHi36O7P4WDnHSRbOrOkn9x6tn3jp7fMy46+E8YrN1k7"
+    "x8z7xkTQ0TRYr7iCyGP/bRN7U5GWzX680BgZDy2cBzFr4CBBNj3Ie+V297lfzr7x89+JYnTM"
+    "/Wcw7gAAAABJRU5ErkJggg=="
+)
 
 
 # ─────────────────────────────────────────────
@@ -167,11 +200,13 @@ def styled_button(parent, text, command, color=ACCENT, width=None):
 # FILE TREE WIDGET (reused in multiple panels)
 # ─────────────────────────────────────────────
 class FileTree(tk.Frame):
-    def __init__(self, parent, root_path="", on_select=None, readonly=False, **kwargs):
+    def __init__(self, parent, root_path="", on_select=None, readonly=False,
+                 on_new_folder=None, **kwargs):
         super().__init__(parent, bg=BG2, **kwargs)
         self.root_path = root_path
         self.on_select_cb = on_select
         self.readonly = readonly
+        self.on_new_folder_cb = on_new_folder
         self._build()
         if root_path and os.path.exists(root_path):
             self.load(root_path)
@@ -203,6 +238,15 @@ class FileTree(tk.Frame):
         tk.Button(toolbar, text="🔄", command=self.refresh,
                   bg=BG3, fg=TEXT_DIM, font=FONT_BOLD, relief="flat", bd=0,
                   padx=8, cursor="hand2").pack(side="left", padx=(0, 6))
+
+        # "New folder" button — only shown when a callback was supplied
+        # (source tree gets one; read-only drive-preview trees don't).
+        if self.on_new_folder_cb:
+            self._new_folder_icon = tk.PhotoImage(data=NEW_FOLDER_ICON_B64)
+            tk.Button(toolbar, image=self._new_folder_icon,
+                      command=self.on_new_folder_cb,
+                      bg=BG3, activebackground=BG3, relief="flat", bd=0,
+                      padx=4, cursor="hand2").pack(side="left", padx=(0, 6))
 
         # Treeview
         cols = ("size", "modified")
@@ -628,6 +672,7 @@ class ControlPanel(tk.Toplevel):
         # ── Source selector bar ───────────────
         src_frame = tk.Frame(self, bg=BG2, pady=5, padx=8)
         src_frame.pack(fill="x", padx=6, pady=(6, 0))
+        self._src_frame = src_frame
 
         tk.Label(src_frame, text="SOURCE:", font=FONT_BOLD, fg=TEXT_DIM,
                  bg=BG2).pack(side="left", padx=(0, 6))
@@ -643,11 +688,18 @@ class ControlPanel(tk.Toplevel):
                                     relief="flat", bd=0)
         rb_custom.pack(side="left", padx=(0, 4))
 
+        # Row 1: drives 1..MAIN_DRIVES (same row as "Custom path")
+        # Row 2: drives MAIN_DRIVES+1..NUM_DRIVES (extra drives, own row)
+        src_frame2 = tk.Frame(self, bg=BG2, pady=0, padx=8)
+        tk.Label(src_frame2, text="", font=FONT_BOLD, bg=BG2).pack(
+            side="left", padx=(0, 6))  # spacer to align with "SOURCE:" above
+
         self.drive_rbs = []
-        for i in range(4):
+        for i in range(NUM_DRIVES):
             drv = self.config["drives"][i]
             lbl = os.path.splitdrive(drv)[0] if drv else f"Drive {i+1}"
-            rb = tk.Radiobutton(src_frame, text=lbl,
+            row = src_frame if i < MAIN_DRIVES else src_frame2
+            rb = tk.Radiobutton(row, text=lbl,
                                  variable=self.src_mode, value=f"drive{i}",
                                  command=self._on_src_mode_change,
                                  bg=BG2, fg=TEXT_DIM, selectcolor=BG2,
@@ -656,6 +708,9 @@ class ControlPanel(tk.Toplevel):
                                  relief="flat", bd=0)
             rb.pack(side="left", padx=2)
             self.drive_rbs.append(rb)
+        if any(self.config["drives"][MAIN_DRIVES:NUM_DRIVES]):
+            src_frame2.pack(fill="x", padx=6, pady=(0, 5))
+        self._src_frame2 = src_frame2
 
         # Custom path entry row
         path_row = tk.Frame(self, bg=BG2, pady=3, padx=8)
@@ -702,7 +757,8 @@ class ControlPanel(tk.Toplevel):
         tree_frame.pack(fill="both", expand=True)
         self.source_tree = FileTree(tree_frame,
                                      root_path=self.src_var.get(),
-                                     on_select=self._on_source_select)
+                                     on_select=self._on_source_select,
+                                     on_new_folder=self._create_new_folder_everywhere)
         self.source_tree.tree.bind("<Double-1>", self._on_source_navigate, add="+")
         self.source_tree.tree.bind("<Button-3>", self._source_context_menu)
         self._orig_go_up = self.source_tree.go_up
@@ -720,22 +776,35 @@ class ControlPanel(tk.Toplevel):
         # ── Destination checkboxes ────────────
         dest_frame = tk.Frame(self, bg=BG2, pady=5, padx=12)
         dest_frame.pack(fill="x", padx=6, pady=(2, 0))
+        self._dest_frame = dest_frame
         tk.Label(dest_frame, text="COPY TO:", font=FONT_BOLD, fg=TEXT_DIM,
                  bg=BG2).pack(side="left", padx=(0, 10))
+
+        # Second row for extra drives (5..NUM_DRIVES), created below dest_frame
+        dest_frame2 = tk.Frame(self, bg=BG2, pady=0, padx=12)
+        tk.Label(dest_frame2, text="", font=FONT_BOLD, bg=BG2).pack(
+            side="left", padx=(0, 10))  # spacer to align with "COPY TO:"
+
         self.dest_vars = []
         self.dest_cbs  = []
-        for i in range(4):
+        for i in range(NUM_DRIVES):
             var = tk.BooleanVar(value=True)
             self.dest_vars.append(var)
             drv = self.config["drives"][i]
             label = os.path.splitdrive(drv)[0] if drv else f"Drive {i+1}"
-            cb = tk.Checkbutton(dest_frame, text=label, variable=var,
+            row = dest_frame if i < MAIN_DRIVES else dest_frame2
+            cb = tk.Checkbutton(row, text=label, variable=var,
                                  bg=BG2, fg=TEXT, selectcolor=BG2,
                                  activebackground=BG2, activeforeground=TEXT,
                                  font=FONT_MAIN, cursor="hand2",
                                  relief="flat", bd=0)
             cb.pack(side="left", padx=6)
             self.dest_cbs.append(cb)
+
+        # Only show the extra-drives row once any of drives 5..8 are configured
+        if any(self.config["drives"][MAIN_DRIVES:NUM_DRIVES]):
+            dest_frame2.pack(fill="x", padx=6, pady=(0, 5))
+        self._dest_frame2 = dest_frame2
 
         # ── Action buttons ────────────────────
         btn_frame = tk.Frame(self, bg=BG, pady=5)
@@ -1019,6 +1088,16 @@ class ControlPanel(tk.Toplevel):
             drv = self.config["drives"][i]
             lbl = os.path.splitdrive(drv)[0] if drv else f"Drive {i+1}"
             cb.config(text=lbl)
+        # Show the "extra drives" rows only once any of drives 5..8 are configured
+        extra_configured = any(self.config["drives"][MAIN_DRIVES:NUM_DRIVES])
+        if extra_configured:
+            if not self._src_frame2.winfo_ismapped():
+                self._src_frame2.pack(fill="x", padx=6, pady=(0, 5), after=self._src_frame)
+            if not self._dest_frame2.winfo_ismapped():
+                self._dest_frame2.pack(fill="x", padx=6, pady=(0, 5), after=self._dest_frame)
+        else:
+            self._src_frame2.pack_forget()
+            self._dest_frame2.pack_forget()
 
     # ══════════════════════════════════════════
     # NAVIGATION SYNC
@@ -1555,6 +1634,57 @@ class ControlPanel(tk.Toplevel):
         self._selected_paths = []
         self.source_tree.refresh()
         self.log.log(f"Remove complete: {removed} item(s) removed.", "ok")
+
+    def _create_new_folder_everywhere(self):
+        """Create a new folder in the currently browsed source directory,
+        and mirror it into the same relative location on every active
+        destination drive."""
+        current_dir = self.source_tree.root_path
+        if not current_dir or not os.path.isdir(current_dir):
+            messagebox.showerror("New folder", "No valid source folder is open.")
+            return
+        name = self._ask_name("New folder name", "New Folder")
+        if not name:
+            return
+        # Guard against path separators / illegal names sneaking in
+        if any(c in name for c in '\\/:*?"<>|'):
+            messagebox.showerror("New folder", "Folder name contains invalid characters.")
+            return
+
+        new_path = os.path.join(current_dir, name)
+        if os.path.exists(new_path):
+            messagebox.showerror("New folder", f"'{name}' already exists here.")
+            return
+
+        try:
+            os.makedirs(new_path)
+            self.log.log(f"📁 Created folder: {name} (source)", "ok")
+        except Exception as e:
+            self.log.log(f"✘ Could not create folder (source): {e}", "err")
+            messagebox.showerror("New folder", f"Could not create folder:\n{e}")
+            return
+
+        created, failed = 0, 0
+        for drive_idx, drive_root in self._get_active_drives():
+            panel = self.drive_panels[drive_idx]
+            rel = panel.relative_subpath
+            dest_folder = os.path.join(drive_root, rel) if rel else drive_root
+            target = os.path.join(dest_folder, name)
+            try:
+                os.makedirs(target, exist_ok=True)
+                created += 1
+                self.log.log(f"📁 Created folder: {name} → Drive {drive_idx+1}", "ok")
+            except Exception as e:
+                failed += 1
+                self.log.log(f"✘ Could not create folder on Drive {drive_idx+1}: {e}", "err")
+            panel.refresh()
+
+        self.source_tree.refresh()
+        summary = f"Folder '{name}' created."
+        if created or failed:
+            summary += f" ({created} drive(s) ok"
+            summary += f", {failed} failed)" if failed else ")"
+        self.log.log(summary, "ok" if not failed else "warn")
 
     def _choose_source(self):
         path = filedialog.askdirectory(title="Select source folder")
@@ -2231,6 +2361,62 @@ class ControlPanel(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────
+# EXTRA DRIVES WINDOW (drives 5..NUM_DRIVES)
+# ─────────────────────────────────────────────
+class ExtraDrivesWindow(tk.Toplevel):
+    """Secondary window holding drive panels 5..NUM_DRIVES.
+    Hidden (withdrawn) rather than destroyed on close, so the DrivePanel
+    widgets inside it (and their state) stay alive for the whole session."""
+    def __init__(self, parent, config, on_close=None):
+        super().__init__(parent)
+        self.config_data = config
+        self._on_close_cb = on_close
+        self.title("BackupFlow – More Drives (5–8)")
+        self.configure(bg=BG)
+        self.geometry("1280x780")
+        self.minsize(800, 500)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build()
+        self.update_idletasks()
+        apply_dark_titlebar(self)
+
+    def _build(self):
+        header = tk.Frame(self, bg=BG3, pady=10, padx=16)
+        header.pack(fill="x")
+        tk.Label(header, text="💾  BackupFlow", font=("Segoe UI", 16, "bold"),
+                 fg=ACCENT2, bg=BG3).pack(side="left")
+        tk.Label(header, text="More Drives (5–8)",
+                 font=FONT_MAIN, fg=TEXT_DIM, bg=BG3).pack(side="left", padx=16)
+        tk.Button(header, text="🔄  Refresh", command=self._refresh_all,
+                  bg=BG2, fg=TEXT_DIM, font=FONT_BOLD, relief="flat",
+                  padx=10, pady=4, cursor="hand2").pack(side="right", padx=6)
+
+        grid = tk.Frame(self, bg=BG)
+        grid.pack(fill="both", expand=True, padx=6, pady=6)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
+        grid.rowconfigure(0, weight=1)
+        grid.rowconfigure(1, weight=1)
+
+        self.drive_panels = []
+        positions = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        for slot, (row, col) in enumerate(positions):
+            drive_index = MAIN_DRIVES + slot  # 4..7
+            panel = DrivePanel(grid, drive_index, self.config_data)
+            panel.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+            self.drive_panels.append(panel)
+
+    def _refresh_all(self):
+        for panel in self.drive_panels:
+            panel.refresh()
+
+    def _on_close(self):
+        if self._on_close_cb:
+            self._on_close_cb()
+        self.withdraw()
+
+
+# ─────────────────────────────────────────────
 # MAIN WINDOW (4 drive panels)
 # ─────────────────────────────────────────────
 # Base class is TkinterDnD.Tk when available so every child widget
@@ -2261,6 +2447,11 @@ class MainWindow(_TkBase):  # type: ignore[misc]
         tk.Button(header, text="⌨  Control Panel", command=self._open_control_panel,
                   bg=ACCENT, fg=TEXT, font=FONT_BOLD, relief="flat",
                   padx=12, pady=4, cursor="hand2").pack(side="right")
+        self.more_drives_btn = tk.Button(
+            header, text="🖥  More Drives (5–8)", command=self._toggle_extra_drives,
+            bg=BG2, fg=TEXT_DIM, font=FONT_BOLD, relief="flat",
+            padx=10, pady=4, cursor="hand2")
+        self.more_drives_btn.pack(side="right", padx=6)
         tk.Button(header, text="🔄  Refresh all", command=self._refresh_all,
                   bg=BG2, fg=TEXT_DIM, font=FONT_BOLD, relief="flat",
                   padx=10, pady=4, cursor="hand2").pack(side="right", padx=6)
@@ -2280,6 +2471,15 @@ class MainWindow(_TkBase):  # type: ignore[misc]
             panel.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
             self.drive_panels.append(panel)
 
+        # Extra drives (5..8) live in a secondary window. It's created now
+        # (hidden) so self.drive_panels always has all NUM_DRIVES entries —
+        # the Control Panel's copy/move/delete/sync/eject logic addresses
+        # drives purely by index and expects every slot to exist.
+        self.extra_window = ExtraDrivesWindow(
+            self, self.config_data, on_close=self._on_extra_window_closed)
+        self.extra_window.withdraw()
+        self.drive_panels.extend(self.extra_window.drive_panels)
+
         # ── Status bar ──
         status = tk.Frame(self, bg=BG3, pady=4)
         status.pack(fill="x", side="bottom")
@@ -2295,6 +2495,21 @@ class MainWindow(_TkBase):  # type: ignore[misc]
     def _refresh_all(self):
         for panel in self.drive_panels:
             panel.refresh()
+
+    def _toggle_extra_drives(self):
+        if self.extra_window.state() == "withdrawn":
+            self.extra_window.deiconify()
+            self.extra_window.lift()
+            x = self.winfo_x() + 40
+            y = self.winfo_y() + 40
+            self.extra_window.geometry(f"+{x}+{y}")
+            self.more_drives_btn.config(text="🖥  Hide Drives (5–8)", bg=ACCENT, fg=TEXT)
+        else:
+            self.extra_window.withdraw()
+            self.more_drives_btn.config(text="🖥  More Drives (5–8)", bg=BG2, fg=TEXT_DIM)
+
+    def _on_extra_window_closed(self):
+        self.more_drives_btn.config(text="🖥  More Drives (5–8)", bg=BG2, fg=TEXT_DIM)
 
     def _open_control_panel(self):
         if self.control_panel and self.control_panel.winfo_exists():
