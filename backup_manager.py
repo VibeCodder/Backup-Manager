@@ -34,6 +34,27 @@ except ImportError:
     except Exception:
         _dnd_mod = None
 
+# ── Try to import Pillow (image preview). Auto-install if missing. ──────────
+PIL_AVAILABLE = False
+try:
+    from PIL import Image, ImageTk, ImageOps
+    PIL_AVAILABLE = True
+except ImportError:
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "pillow", "--quiet"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        from PIL import Image, ImageTk, ImageOps
+        PIL_AVAILABLE = True
+    except Exception:
+        Image = ImageTk = ImageOps = None
+
+# Extensions shown in the image preview panel of the source tree
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+              ".tif", ".tiff", ".ico"}
+PREVIEW_WIDTH = 300   # px, width of the preview panel
+
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
@@ -201,8 +222,14 @@ def styled_button(parent, text, command, color=ACCENT, width=None):
 # ─────────────────────────────────────────────
 class FileTree(tk.Frame):
     def __init__(self, parent, root_path="", on_select=None, readonly=False,
-                 on_new_folder=None, **kwargs):
+                 on_new_folder=None, show_preview=False, **kwargs):
         super().__init__(parent, bg=BG2, **kwargs)
+        self.show_preview = show_preview
+        self._preview_path = None      # path currently shown in the preview
+        self._preview_token = 0        # invalidates stale background loads
+        self._preview_job = None       # debounce timer id
+        self._preview_img = None       # keep a reference (Tk would GC it)
+        self._preview_last_size = (0, 0)
         self.root_path = root_path
         self.on_select_cb = on_select
         self.readonly = readonly
@@ -265,8 +292,11 @@ class FileTree(tk.Frame):
         hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        if self.show_preview:
+            self._build_preview()
+            self.preview_frame.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
 
         self.tree.bind("<Double-1>", self._on_double_click)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
@@ -353,29 +383,57 @@ class FileTree(tk.Frame):
     def _drag_end(self, event):
         self._drag_data["dragging"] = False
 
-    def load(self, path, _from_history=False):
+    @staticmethod
+    def list_directory(path):
+        """Pure disk I/O — safe to call from a background thread. Returns a
+        list of (full_path, name, is_dir, size_str, mtime_str) tuples, or
+        None if the path is missing/unreadable. Does not touch any widget."""
         if not path or not os.path.exists(path):
-            return
-        self.root_path = path
-        self.path_var.set(path)
-        self.tree.delete(*self.tree.get_children())
+            return None
         try:
             items = sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))
         except PermissionError:
-            return
+            return None
+        result = []
         for entry in items:
-            icon = get_item_icon(entry.path)
+            icon_path = entry.path
             try:
                 stat = entry.stat()
                 size = format_size(stat.st_size) if entry.is_file() else ""
                 mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%d.%m.%y %H:%M")
-            except:
+            except Exception:
                 size, mtime = "", ""
-            iid = self.tree.insert("", "end", text=f"  {icon}  {entry.name}",
+            result.append((icon_path, entry.name, entry.is_dir(), size, mtime))
+        return result
+
+    def apply_entries(self, path, entries):
+        """Populate the tree from already-fetched entries (see
+        list_directory). This is the ONLY part of a refresh that touches Tk
+        widgets, so it's safe to call from the main thread after a
+        background list_directory() call — used for non-blocking refreshes
+        while a copy/move/sync is in progress on the same drive."""
+        self.root_path = path
+        self.path_var.set(path)
+        self.tree.delete(*self.tree.get_children())
+        self.tree._item_paths = {}
+        if self.show_preview:
+            self._preview_clear()
+        if not entries:
+            return
+        for full_path, name, is_dir, size, mtime in entries:
+            icon = get_item_icon(full_path)
+            iid = self.tree.insert("", "end", text=f"  {icon}  {name}",
                                     values=(size, mtime),
-                                    tags=("dir" if entry.is_dir() else "file",))
-            self.tree._item_paths = getattr(self.tree, "_item_paths", {})
-            self.tree._item_paths[iid] = entry.path
+                                    tags=("dir" if is_dir else "file",))
+            self.tree._item_paths[iid] = full_path
+
+    def load(self, path, _from_history=False):
+        if not path or not os.path.exists(path):
+            return
+        entries = self.list_directory(path)
+        if entries is None:
+            return
+        self.apply_entries(path, entries)
 
     def go_up(self):
         parent = str(Path(self.root_path).parent)
@@ -392,10 +450,178 @@ class FileTree(tk.Frame):
             self.load(path)
 
     def _on_select(self, event):
+        if self.show_preview:
+            self._preview_update_from_selection()
         if self.on_select_cb:
             items = self.tree.selection()
             paths = [getattr(self.tree, "_item_paths", {}).get(i) for i in items]
             self.on_select_cb([p for p in paths if p])
+
+    # ── Image preview panel ───────────────────────────────────────────────
+    def _build_preview(self):
+        self.preview_frame = tk.Frame(self, bg=BG, width=PREVIEW_WIDTH,
+                                      highlightthickness=1,
+                                      highlightbackground=BORDER)
+        self.preview_frame.pack_propagate(False)
+        self.preview_info = tk.Label(self.preview_frame, text="", font=FONT_SMALL,
+                                     fg=TEXT_DIM, bg=BG, justify="center",
+                                     wraplength=PREVIEW_WIDTH - 16)
+        self.preview_info.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+        self.preview_label = tk.Label(self.preview_frame, text="", font=FONT_SMALL,
+                                      fg=TEXT_DIM, bg=BG, bd=0)
+        self.preview_label.pack(side="top", fill="both", expand=True,
+                                padx=4, pady=4)
+        self.preview_frame.bind("<Configure>", self._preview_on_resize)
+        self._preview_clear()
+
+    def _preview_clear(self, message="No image selected"):
+        """Reset the panel to its placeholder state."""
+        self._preview_token += 1
+        self._preview_path = None
+        self._preview_img = None
+        if self._preview_job is not None:
+            try:
+                self.after_cancel(self._preview_job)
+            except Exception:
+                pass
+            self._preview_job = None
+        try:
+            self.preview_label.config(image="", text=message)
+            self.preview_info.config(text="")
+        except Exception:
+            pass
+
+    def _preview_update_from_selection(self):
+        sel = self.tree.selection()
+        path = None
+        if sel:
+            focus = self.tree.focus()
+            iid = focus if focus in sel else sel[-1]
+            path = getattr(self.tree, "_item_paths", {}).get(iid)
+        if (path and os.path.isfile(path)
+                and Path(path).suffix.lower() in IMAGE_EXTS):
+            if path != self._preview_path:
+                self._preview_request(path)
+        else:
+            self._preview_clear()
+
+    def _preview_target_size(self):
+        w = self.preview_frame.winfo_width()
+        h = self.preview_frame.winfo_height()
+        if w <= 1:
+            w = PREVIEW_WIDTH
+        if h <= 1:
+            h = 300
+        # leave room for paddings and the caption under the image
+        return max(w - 16, 40), max(h - 70, 40)
+
+    def _preview_request(self, path):
+        """Debounced: fast arrow-key scrolling won't load every image."""
+        self._preview_path = path
+        self._preview_token += 1
+        token = self._preview_token
+        if self._preview_job is not None:
+            try:
+                self.after_cancel(self._preview_job)
+            except Exception:
+                pass
+        self._preview_job = self.after(
+            80, lambda: self._preview_start(path, token))
+
+    def _preview_start(self, path, token):
+        self._preview_job = None
+        if token != self._preview_token:
+            return
+        size = self._preview_target_size()
+        self._preview_last_size = size
+        self.preview_label.config(image="", text="Loading…")
+        if not PIL_AVAILABLE:
+            self._preview_fallback_tk(path, size)
+            return
+        threading.Thread(target=self._preview_worker,
+                         args=(path, size, token), daemon=True).start()
+
+    def _preview_worker(self, path, size, token):
+        """Background thread: disk I/O + decoding + resizing (no Tk calls)."""
+        try:
+            img = Image.open(path)
+            orig_w, orig_h = img.size
+            fmt = img.format or ""
+            try:
+                img.draft("RGB", (size[0] * 2, size[1] * 2))  # fast JPEG decode
+            except Exception:
+                pass
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+            img = img.convert("RGBA")
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            img.thumbnail(size, resample)      # never upscales
+            # flatten transparency onto the panel background
+            bg = Image.new("RGBA", img.size, BG2)
+            bg.alpha_composite(img)
+            img = bg.convert("RGB")
+            try:
+                fsize = format_size(os.path.getsize(path))
+            except Exception:
+                fsize = ""
+            info = f"{os.path.basename(path)}\n{orig_w} × {orig_h} px"
+            if fsize:
+                info += f"  ·  {fsize}"
+            if fmt:
+                info += f"  ·  {fmt}"
+            result = (img, info, None)
+        except Exception as exc:
+            result = (None, os.path.basename(path), str(exc))
+        try:
+            self.after(0, lambda: self._preview_apply(token, *result))
+        except Exception:
+            pass  # widget destroyed
+
+    def _preview_apply(self, token, pil_img, info, error):
+        if token != self._preview_token:
+            return  # selection changed while loading
+        try:
+            if pil_img is None:
+                self._preview_img = None
+                self.preview_label.config(image="", text="Cannot preview this file")
+                self.preview_info.config(text=info)
+                return
+            self._preview_img = ImageTk.PhotoImage(pil_img)
+            self.preview_label.config(image=self._preview_img, text="")
+            self.preview_info.config(text=info)
+        except Exception:
+            pass
+
+    def _preview_fallback_tk(self, path, size):
+        """No Pillow: Tk itself can only show PNG/GIF (scaled down by integer
+        factors)."""
+        try:
+            if Path(path).suffix.lower() not in (".png", ".gif"):
+                raise ValueError("needs Pillow")
+            img = tk.PhotoImage(file=path)
+            f = max(1, -(-img.width() // size[0]), -(-img.height() // size[1]))
+            if f > 1:
+                img = img.subsample(f, f)
+            self._preview_img = img
+            self.preview_label.config(image=img, text="")
+            self.preview_info.config(text=os.path.basename(path))
+        except Exception:
+            self._preview_img = None
+            self.preview_label.config(
+                image="", text="Install Pillow to preview this format")
+            self.preview_info.config(text=os.path.basename(path))
+
+    def _preview_on_resize(self, event):
+        """Re-render when the panel is resized (window resize / maximize)."""
+        if not self._preview_path:
+            return
+        new = (max(event.width - 16, 40), max(event.height - 70, 40))
+        old = self._preview_last_size
+        if abs(new[0] - old[0]) < 8 and abs(new[1] - old[1]) < 8:
+            return
+        self._preview_request(self._preview_path)
 
     def get_selected_paths(self):
         items = self.tree.selection()
@@ -435,9 +661,25 @@ class DrivePanel(tk.Frame):
                               font=FONT_TITLE, fg=TEXT, bg=BG3)
         title_lbl.pack(side="left")
 
-        tk.Button(header, text="📂 Select", command=self.choose_drive,
+        select_btn = tk.Button(header, text="📂 Select", command=self.choose_drive,
                   bg=ACCENT, fg=TEXT, font=FONT_SMALL, relief="flat",
-                  padx=6, pady=2, cursor="hand2").pack(side="right", padx=8)
+                  padx=6, pady=2, cursor="hand2")
+        select_btn.pack(side="right", padx=8)
+
+        # Operation status (copying/moving/syncing/ejecting/disconnected...).
+        # Lives in the header, between the title and the Select button, so it
+        # adds no extra vertical row to the panel — an earlier version used a
+        # standalone row here which pushed the main window's bottom status
+        # bar past the fixed window height and got clipped.
+        # Kept SEPARATE from the path bar below: browsing folders during a
+        # copy used to overwrite the "⏳ Copying..." message because both
+        # used to share one label. This one is only ever touched by
+        # set_status() (copy/move/sync/eject progress + connect/disconnect).
+        self.op_status_var = tk.StringVar(value="")
+        self.op_status_bar = tk.Label(header, textvariable=self.op_status_var,
+                                       font=FONT_SMALL, fg=TEXT_DIM, bg=BG3,
+                                       anchor="e", padx=6)
+        self.op_status_bar.pack(side="right", fill="x", expand=True, padx=(12, 0))
 
         # Drive info bar
         self.info_frame = tk.Frame(self, bg=BG2, pady=4)
@@ -457,12 +699,13 @@ class DrivePanel(tk.Frame):
         self.file_tree = FileTree(self, root_path=self.drive_path, readonly=True)
         self.file_tree.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # Status bar
-        self.status_var = tk.StringVar(value="Ready")
-        self.status_bar = tk.Label(self, textvariable=self.status_var,
-                                    font=FONT_SMALL, fg=TEXT_DIM, bg=BG3,
-                                    anchor="w", padx=6)
-        self.status_bar.pack(fill="x", side="bottom")
+        # Path bar — always shows the current folder relative to the drive
+        # root. Only touched by navigate_to_relative()/refresh()/set_drive().
+        self.path_var = tk.StringVar(value="")
+        self.path_bar = tk.Label(self, textvariable=self.path_var,
+                                  font=FONT_SMALL, fg=TEXT_DIM, bg=BG3,
+                                  anchor="w", padx=6)
+        self.path_bar.pack(fill="x", side="bottom")
 
         self._update_info()
         # Start watching this drive for disconnects/reconnects so the file
@@ -477,6 +720,7 @@ class DrivePanel(tk.Frame):
     def set_drive(self, path):
         self.drive_path = path
         self.relative_subpath = ""
+        self.path_var.set("")
         self.config["drives"][self.drive_index] = path
         save_config(self.config)
         self._available = bool(path and os.path.exists(path))
@@ -556,9 +800,11 @@ class DrivePanel(tk.Frame):
             target = self.drive_path
         if os.path.exists(target):
             self.file_tree.load(target)
-            self.set_status(f"📂 {rel_subpath or '(root)'}", ACCENT2)
+            self.path_var.set(f"📂 {rel_subpath or '(root)'}")
+            self.path_bar.config(fg=TEXT_DIM)
         else:
-            self.set_status(f"✘ missing: {rel_subpath}", RED)
+            self.path_var.set(f"✘ missing: {rel_subpath}")
+            self.path_bar.config(fg=RED)
 
     def _update_info(self):
         if self.drive_path and os.path.exists(self.drive_path):
@@ -589,9 +835,61 @@ class DrivePanel(tk.Frame):
             self.file_tree.tree.delete(*self.file_tree.tree.get_children())
             self.file_tree.path_var.set("")
 
+    def refresh_async(self):
+        """Non-blocking refresh: shutil.disk_usage() and the directory
+        listing both do real disk I/O, which can stall for a long time (or
+        effectively forever) if another operation is actively copying to
+        the same drive. refresh() ran that I/O directly on the main thread,
+        so clicking "Refresh drives" mid-copy could freeze the whole app.
+        This does the I/O on a worker thread and only touches widgets in
+        _apply_refresh(), scheduled back onto the main thread via after() —
+        same pattern as _availability_worker. Safe to call from any thread."""
+        if getattr(self, "_refresh_running", False):
+            return
+        self._refresh_running = True
+        drive_path = self.drive_path
+        listing_path = self.file_tree.root_path or drive_path
+        threading.Thread(target=self._refresh_worker,
+                          args=(drive_path, listing_path), daemon=True).start()
+
+    def _refresh_worker(self, drive_path, listing_path):
+        exists = bool(drive_path) and os.path.exists(drive_path)
+        total = used = free = None
+        if exists:
+            total, used, free = get_drive_info(drive_path)
+        entries = FileTree.list_directory(listing_path) if exists else None
+        self.after(0, self._apply_refresh, exists, total, used, free, listing_path, entries)
+
+    def _apply_refresh(self, exists, total, used, free, listing_path, entries):
+        self._refresh_running = False
+        self._available = exists
+        self.dot_label.config(fg=GREEN if exists else RED)
+        if exists and total:
+            pct = (used / total) * 100
+            self.progress["value"] = pct
+            self.info_label.config(
+                text=f"Free: {format_size(free)}  |  Used: {format_size(used)}  |  Total: {format_size(total)}",
+                fg=TEXT
+            )
+            short = os.path.splitdrive(self.drive_path)[0] or self.drive_path[:20]
+            self.title_var.set(f"Drive {self.drive_index + 1}  ({short})")
+        else:
+            self.info_label.config(text="— no drive —", fg=TEXT_DIM)
+            self.progress["value"] = 0
+            self.title_var.set(f"Drive {self.drive_index + 1}")
+        if exists:
+            if entries is not None:
+                self.file_tree.apply_entries(listing_path, entries)
+        else:
+            self.file_tree.tree.delete(*self.file_tree.tree.get_children())
+            self.file_tree.path_var.set("")
+
     def set_status(self, msg, color=TEXT_DIM):
-        self.status_var.set(msg)
-        self.status_bar.config(fg=color)
+        """Operation status (copying/moving/syncing/ejecting/connect state).
+        Separate from the path bar so it can't be clobbered by folder
+        navigation happening at the same time (see _sync_drive_panels)."""
+        self.op_status_var.set(msg)
+        self.op_status_bar.config(fg=color)
 
 
 # ─────────────────────────────────────────────
@@ -758,7 +1056,8 @@ class ControlPanel(tk.Toplevel):
         self.source_tree = FileTree(tree_frame,
                                      root_path=self.src_var.get(),
                                      on_select=self._on_source_select,
-                                     on_new_folder=self._create_new_folder_everywhere)
+                                     on_new_folder=self._create_new_folder_everywhere,
+                                     show_preview=True)
         self.source_tree.tree.bind("<Double-1>", self._on_source_navigate, add="+")
         self.source_tree.tree.bind("<Button-3>", self._source_context_menu)
         self._orig_go_up = self.source_tree.go_up
@@ -815,8 +1114,9 @@ class ControlPanel(tk.Toplevel):
         self.move_btn = styled_button(btn_frame, "✂  MOVE SELECTED",
                                        self._move_selected, "#f97316")
         self.move_btn.pack(side="left", padx=(0, 6))
-        styled_button(btn_frame, "🗑  DELETE from drives",
-                      self._delete_selected, RED).pack(side="left", padx=(0, 6))
+        self.delete_btn = styled_button(btn_frame, "🗑  DELETE from drives",
+                      self._delete_selected, RED)
+        self.delete_btn.pack(side="left", padx=(0, 6))
         styled_button(btn_frame, "🔄 SYNC folder",
                       self._sync_all, ORANGE).pack(side="left", padx=(0, 6))
         self.progress_var = tk.DoubleVar()
@@ -1579,7 +1879,7 @@ class ControlPanel(tk.Toplevel):
                     self.log.log(f"✎ Renamed on Drive {drive_idx+1}: {old_name} → {new_name}", "ok")
                 except Exception as e:
                     self.log.log(f"✘ Rename error on Drive {drive_idx+1}: {e}", "err")
-            panel.refresh()
+            panel.refresh_async()
 
         self._selected_paths = []
         self.source_tree.refresh()
@@ -1629,7 +1929,7 @@ class ControlPanel(tk.Toplevel):
                     self.log.log(f"✘ Remove error {name} on Drive {drive_idx+1}: {e}", "err")
 
         for drive_idx, _ in drives:
-            self.drive_panels[drive_idx].refresh()
+            self.drive_panels[drive_idx].refresh_async()
 
         self._selected_paths = []
         self.source_tree.refresh()
@@ -1677,7 +1977,7 @@ class ControlPanel(tk.Toplevel):
             except Exception as e:
                 failed += 1
                 self.log.log(f"✘ Could not create folder on Drive {drive_idx+1}: {e}", "err")
-            panel.refresh()
+            panel.refresh_async()
 
         self.source_tree.refresh()
         summary = f"Folder '{name}' created."
@@ -1712,8 +2012,11 @@ class ControlPanel(tk.Toplevel):
     # DRIVES
     # ══════════════════════════════════════════
     def _refresh_drives(self):
+        # refresh_async: refresh() blocks on disk I/O and would freeze the
+        # whole app if a drive is busy from an ongoing copy/move/sync — this
+        # is the exact "Refresh Drives freezes the app mid-copy" bug.
         for panel in self.drive_panels:
-            panel.refresh()
+            panel.refresh_async()
         self._update_drive_rb_labels()
         self._refresh_fav_list()
 
@@ -1729,6 +2032,32 @@ class ControlPanel(tk.Toplevel):
     # ══════════════════════════════════════════
     # COPY / DELETE / SYNC
     # ══════════════════════════════════════════
+    def _ui(self, fn, *args, **kwargs):
+        """Schedule a Tk widget update from a background thread.
+        Tk/Tcl is NOT thread-safe: calling widget methods directly from a
+        worker thread (e.g. self.log.log(...), panel.set_status(...),
+        messagebox.showinfo(...)) races with the main thread's event loop
+        and can freeze the whole app with no error, especially while the
+        user is interacting with the UI at the same time (e.g. browsing
+        folders). Everything that touches a widget from _do_copy/_do_move/
+        _do_sync/_do_eject must go through here instead — same pattern as
+        _availability_worker uses via its queue."""
+        try:
+            self.after(0, lambda: fn(*args, **kwargs))
+        except Exception:
+            pass  # widget destroyed
+
+    def _clear_all_drive_statuses(self):
+        """Clear the operation-status text ('✔ Done', '✔ Synced', ...) on
+        EVERY drive panel, not just the ones in this operation's active
+        drive list. Without this, a panel left out of a new copy/move/
+        delete/sync (e.g. its checkbox got unticked) keeps showing the
+        leftover status from the previous operation forever — including
+        while a different drive is actively "⏳ Copying...". Must run via
+        self._ui() since this is always called from a background thread."""
+        for panel in self.drive_panels:
+            self._ui(panel.set_status, "", TEXT_DIM)
+
     def _copy_selected(self):
         if self._copying:
             self.log.log("Copy in progress – please wait!", "warn")
@@ -1749,17 +2078,25 @@ class ControlPanel(tk.Toplevel):
         threading.Thread(target=self._do_copy, args=(paths, drives), daemon=True).start()
 
     def _do_copy(self, src_paths, drives):
+        # NOTE: this runs in a background thread. No Tk widget may be
+        # touched directly here — everything UI-related goes through
+        # self._ui(...), which marshals it onto the main thread.
+        # refresh_async() is the exception: it's designed to be called from
+        # any thread (it only spawns its own worker + schedules the actual
+        # widget update via after()), so it's called directly, not via _ui.
         self._copying = True
-        self.copy_btn.config(state="disabled")
+        self._ui(self.copy_btn.config, state="disabled")
+        self._clear_all_drive_statuses()
         total = len(src_paths) * len(drives)
         done  = 0
-        self.log.log(f"Copying: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
+        self._ui(self.log.log, f"Copying: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
         for drive_idx, drive_root in drives:
             panel = self.drive_panels[drive_idx]
-            panel.set_status("⏳ Copying...", ORANGE)
+            self._ui(panel.set_status, "⏳ Copying...", ORANGE)
             rel = panel.relative_subpath
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
             os.makedirs(dest_folder, exist_ok=True)
+            last_refresh = 0
             for src in src_paths:
                 if not src:
                     continue
@@ -1772,18 +2109,31 @@ class ControlPanel(tk.Toplevel):
                         shutil.copytree(src, dest)
                     else:
                         shutil.copy2(src, dest)
-                    self.log.log(f"✔ {name} → Drive {drive_idx+1}", "ok")
+                    self._ui(self.log.log, f"✔ {name} → Drive {drive_idx+1}", "ok")
                 except Exception as e:
-                    self.log.log(f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
+                    self._ui(self.log.log, f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
                 done += 1
-                self.progress_var.set((done / total) * 100)
-            panel.set_status("✔ Done", GREEN)
-            panel.refresh()
-        self.progress_var.set(100)
-        self.log.log("Copy complete!", "ok")
+                self._ui(self.progress_var.set, (done / total) * 100)
+                # Live view update — throttled so we're not spawning a
+                # refresh thread per file, but the panel visibly fills in
+                # as items land instead of staying static until the very end.
+                now = time.time()
+                if now - last_refresh > 0.75:
+                    panel.refresh_async()
+                    last_refresh = now
+            self._ui(panel.set_status, "✔ Done", GREEN)
+            panel.refresh_async()
+        # Keep the Control Panel's own file preview in sync too — it can be
+        # pointed at one of the drives (source mode "drive{i}"), and until
+        # now only the drive-panel grid in the main BackupFlow window
+        # refreshed after a copy; this preview was left showing stale
+        # contents until the user manually navigated away and back.
+        self._ui(self.source_tree.refresh)
+        self._ui(self.progress_var.set, 100)
+        self._ui(self.log.log, "Copy complete!", "ok")
         self._copying = False
-        self.copy_btn.config(state="normal")
-        messagebox.showinfo("Done", "Copy completed successfully!")
+        self._ui(self.copy_btn.config, state="normal")
+        self._ui(messagebox.showinfo, "Done", "Copy completed successfully!")
 
     def _move_selected(self):
         if self._copying:
@@ -1814,20 +2164,23 @@ class ControlPanel(tk.Toplevel):
         threading.Thread(target=self._do_move, args=(paths, drives), daemon=True).start()
 
     def _do_move(self, src_paths, drives):
+        # Background thread — all Tk access goes through self._ui(...).
         self._copying = True
-        self.copy_btn.config(state="disabled")
-        self.move_btn.config(state="disabled")
+        self._ui(self.copy_btn.config, state="disabled")
+        self._ui(self.move_btn.config, state="disabled")
+        self._clear_all_drive_statuses()
         total = len(src_paths) * len(drives)
         done = 0
         failed_sources = set()
         same_target_sources = set()
-        self.log.log(f"Moving: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
+        self._ui(self.log.log, f"Moving: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
         for drive_idx, drive_root in drives:
             panel = self.drive_panels[drive_idx]
-            panel.set_status("⏳ Moving...", ORANGE)
+            self._ui(panel.set_status, "⏳ Moving...", ORANGE)
             rel = panel.relative_subpath
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
             os.makedirs(dest_folder, exist_ok=True)
+            last_refresh = 0
             for src in src_paths:
                 if not src:
                     continue
@@ -1842,22 +2195,26 @@ class ControlPanel(tk.Toplevel):
                 try:
                     if same_target:
                         same_target_sources.add(src)
-                        self.log.log(f"↷ {name}: already on Drive {drive_idx+1}, skipping copy", "warn")
+                        self._ui(self.log.log, f"↷ {name}: already on Drive {drive_idx+1}, skipping copy", "warn")
                     elif os.path.isdir(src):
                         if os.path.exists(dest):
                             shutil.rmtree(dest)
                         shutil.copytree(src, dest)
-                        self.log.log(f"✔ {name} → Drive {drive_idx+1}", "ok")
+                        self._ui(self.log.log, f"✔ {name} → Drive {drive_idx+1}", "ok")
                     else:
                         shutil.copy2(src, dest)
-                        self.log.log(f"✔ {name} → Drive {drive_idx+1}", "ok")
+                        self._ui(self.log.log, f"✔ {name} → Drive {drive_idx+1}", "ok")
                 except Exception as e:
-                    self.log.log(f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
+                    self._ui(self.log.log, f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
                     failed_sources.add(src)
                 done += 1
-                self.progress_var.set((done / total) * 100)
-            panel.set_status("✔ Done", GREEN)
-            panel.refresh()
+                self._ui(self.progress_var.set, (done / total) * 100)
+                now = time.time()
+                if now - last_refresh > 0.75:
+                    panel.refresh_async()
+                    last_refresh = now
+            self._ui(panel.set_status, "✔ Done", GREEN)
+            panel.refresh_async()
 
         # Remove originals — only for items that copied successfully to ALL drives
         removed = 0
@@ -1865,7 +2222,8 @@ class ControlPanel(tk.Toplevel):
             if not src or src in failed_sources:
                 continue
             if src in same_target_sources:
-                self.log.log(
+                self._ui(
+                    self.log.log,
                     f"↷ Keeping source (already the copy on a destination drive): "
                     f"{os.path.basename(src)}", "warn"
                 )
@@ -1876,25 +2234,30 @@ class ControlPanel(tk.Toplevel):
                 else:
                     os.remove(src)
                 removed += 1
-                self.log.log(f"✂ Removed source: {os.path.basename(src)}", "warn")
+                self._ui(self.log.log, f"✂ Removed source: {os.path.basename(src)}", "warn")
             except Exception as e:
-                self.log.log(f"✘ Could not remove source {os.path.basename(src)}: {e}", "err")
+                self._ui(self.log.log, f"✘ Could not remove source {os.path.basename(src)}: {e}", "err")
 
         # Clean up queue/selection, refresh views
-        if hasattr(self, '_queue_items'):
-            self._queue_items = [p for p in self._queue_items if p in failed_sources]
-            self._queue_refresh()
-        self._selected_paths = []
-        self.source_tree.refresh()
+        def _finish_move():
+            if hasattr(self, '_queue_items'):
+                self._queue_items = [p for p in self._queue_items if p in failed_sources]
+                self._queue_refresh()
+            self._selected_paths = []
+            self.source_tree.refresh()
+        self._ui(_finish_move)
 
-        self.progress_var.set(100)
-        self.log.log(f"Move complete! {removed} item(s) moved.", "ok")
+        self._ui(self.progress_var.set, 100)
+        self._ui(self.log.log, f"Move complete! {removed} item(s) moved.", "ok")
         self._copying = False
-        self.copy_btn.config(state="normal")
-        self.move_btn.config(state="normal")
-        messagebox.showinfo("Done", "Move completed successfully!")
+        self._ui(self.copy_btn.config, state="normal")
+        self._ui(self.move_btn.config, state="normal")
+        self._ui(messagebox.showinfo, "Done", "Move completed successfully!")
 
     def _delete_selected(self):
+        if self._copying:
+            self.log.log("Operation in progress – please wait!", "warn")
+            return
         paths = self._selected_paths
         if not paths:
             messagebox.showwarning("Nothing selected", "Select items to delete from drives.")
@@ -1910,10 +2273,22 @@ class ControlPanel(tk.Toplevel):
             msg += f"\n... and {len(names)-8} more"
         if not messagebox.askyesno("Confirm delete", msg):
             return
+        threading.Thread(target=self._do_delete, args=(paths, drives), daemon=True).start()
+
+    def _do_delete(self, paths, drives):
+        # Background thread — was previously run directly on the main
+        # thread (shutil.rmtree()/os.remove() + a blocking refresh()),
+        # which froze the UI for the whole delete and never showed
+        # progress. Now matches the copy/move/sync pattern.
+        self._copying = True
+        self._ui(self.delete_btn.config, state="disabled")
+        self._clear_all_drive_statuses()
         for drive_idx, drive_root in drives:
             panel = self.drive_panels[drive_idx]
+            self._ui(panel.set_status, "⏳ Deleting...", ORANGE)
             rel = panel.relative_subpath
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
+            last_refresh = 0
             for src in paths:
                 name = os.path.basename(src)
                 target = os.path.join(dest_folder, name)
@@ -1922,10 +2297,20 @@ class ControlPanel(tk.Toplevel):
                         shutil.rmtree(target)
                     elif os.path.isfile(target):
                         os.remove(target)
-                    self.log.log(f"🗑 {name} deleted from Drive {drive_idx+1}", "warn")
+                    self._ui(self.log.log, f"🗑 {name} deleted from Drive {drive_idx+1}", "warn")
                 except Exception as e:
-                    self.log.log(f"✘ Delete error {name}: {e}", "err")
-            panel.refresh()
+                    self._ui(self.log.log, f"✘ Delete error {name}: {e}", "err")
+                now = time.time()
+                if now - last_refresh > 0.75:
+                    panel.refresh_async()
+                    last_refresh = now
+            self._ui(panel.set_status, "✔ Done", GREEN)
+            panel.refresh_async()
+        # Same reasoning as in _do_copy — keep the Control Panel's own
+        # preview in sync if it happens to be pointed at one of the drives.
+        self._ui(self.source_tree.refresh)
+        self._copying = False
+        self._ui(self.delete_btn.config, state="normal")
 
     def _sync_all(self):
         src = self.source_tree.root_path
@@ -1946,15 +2331,18 @@ class ControlPanel(tk.Toplevel):
         threading.Thread(target=self._do_sync, args=(src, drives, rel), daemon=True).start()
 
     def _do_sync(self, src, drives, rel_subpath):
+        # Background thread — all Tk access goes through self._ui(...).
         self._copying = True
-        self.copy_btn.config(state="disabled")
-        self.log.log(f"Syncing: {src} → {len(drives)} drive(s)", "info")
+        self._ui(self.copy_btn.config, state="disabled")
+        self._clear_all_drive_statuses()
+        self._ui(self.log.log, f"Syncing: {src} → {len(drives)} drive(s)", "info")
         for drive_idx, drive_root in drives:
             panel = self.drive_panels[drive_idx]
-            panel.set_status("⏳ Syncing...", ORANGE)
+            self._ui(panel.set_status, "⏳ Syncing...", ORANGE)
             dest_folder = os.path.join(drive_root, rel_subpath) if rel_subpath else drive_root
             try:
                 os.makedirs(dest_folder, exist_ok=True)
+                last_refresh = 0
                 for item in os.scandir(src):
                     dest = os.path.join(dest_folder, item.name)
                     if item.is_dir():
@@ -1963,15 +2351,22 @@ class ControlPanel(tk.Toplevel):
                         shutil.copytree(item.path, dest)
                     else:
                         shutil.copy2(item.path, dest)
-                    self.log.log(f"✔ {item.name} → Drive {drive_idx+1}", "ok")
-                panel.set_status("✔ Synced", GREEN)
-                panel.refresh()
+                    self._ui(self.log.log, f"✔ {item.name} → Drive {drive_idx+1}", "ok")
+                    now = time.time()
+                    if now - last_refresh > 0.75:
+                        panel.refresh_async()
+                        last_refresh = now
+                self._ui(panel.set_status, "✔ Synced", GREEN)
+                panel.refresh_async()
             except Exception as e:
-                self.log.log(f"✘ Drive {drive_idx+1}: {e}", "err")
-                panel.set_status("✘ Error", RED)
-        self.log.log("Sync complete!", "ok")
+                self._ui(self.log.log, f"✘ Drive {drive_idx+1}: {e}", "err")
+                self._ui(panel.set_status, "✘ Error", RED)
+        # Same reasoning as in _do_copy — keep the Control Panel's own
+        # preview in sync if it happens to be pointed at one of the drives.
+        self._ui(self.source_tree.refresh)
+        self._ui(self.log.log, "Sync complete!", "ok")
         self._copying = False
-        self.copy_btn.config(state="normal")
+        self._ui(self.copy_btn.config, state="normal")
 
     # ══════════════════════════════════════════
     # SAFE EJECT
@@ -1989,6 +2384,7 @@ class ControlPanel(tk.Toplevel):
         threading.Thread(target=self._do_eject, args=(drives,), daemon=True).start()
 
     def _do_eject(self, drives):
+        # Background thread — all Tk access goes through self._ui(...).
         system = platform.system()
         results = []
         for drive_idx, drive_path in drives:
@@ -1999,18 +2395,18 @@ class ControlPanel(tk.Toplevel):
             partial = ok and "mountvol only" in detail
             tag = "warn" if partial else ("ok" if ok else "err")
             status = "✔ Ejected" if ok and not partial else ("⚠ Dismounted only" if partial else "✘ Failed")
-            self.log.log(f"⏏ Drive {drive_idx+1} {status}: {detail}", tag)
+            self._ui(self.log.log, f"⏏ Drive {drive_idx+1} {status}: {detail}", tag)
             results.append((drive_idx, ok, detail, partial))
 
         # Update panels that were successfully ejected
         for drive_idx, ok, _, partial in results:
             panel = self.drive_panels[drive_idx]
             if ok and not partial:
-                panel.set_status("⏏ Ejected – safe to remove", "#22c55e")
+                self._ui(panel.set_status, "⏏ Ejected – safe to remove", "#22c55e")
             elif ok and partial:
-                panel.set_status("⚠ Dismounted only – wait before unplugging", ORANGE)
+                self._ui(panel.set_status, "⚠ Dismounted only – wait before unplugging", ORANGE)
             else:
-                panel.set_status("✘ Eject failed", "#ef4444")
+                self._ui(panel.set_status, "✘ Eject failed", "#ef4444")
 
         success = sum(1 for _, ok, _, partial in results if ok and not partial)
         partial_count = sum(1 for _, ok, _, partial in results if ok and partial)
@@ -2020,7 +2416,7 @@ class ControlPanel(tk.Toplevel):
             summary += f", {partial_count} dismounted only (wait a few seconds before unplugging)"
         if fail:
             summary += f", {fail} failed (check log)"
-        self.after(0, lambda: messagebox.showinfo("Safely Eject", summary))
+        self._ui(messagebox.showinfo, "Safely Eject", summary)
 
     def _eject_drive(self, system, path):
         """Platform-specific eject. Returns (success: bool, detail: str)."""
@@ -2407,8 +2803,10 @@ class ExtraDrivesWindow(tk.Toplevel):
             self.drive_panels.append(panel)
 
     def _refresh_all(self):
+        # refresh_async: refresh() blocks on disk I/O and would freeze the
+        # whole app if a drive is busy from an ongoing copy/move/sync.
         for panel in self.drive_panels:
-            panel.refresh()
+            panel.refresh_async()
 
     def _on_close(self):
         if self._on_close_cb:
@@ -2493,8 +2891,10 @@ class MainWindow(_TkBase):  # type: ignore[misc]
         self.control_panel = None
 
     def _refresh_all(self):
+        # refresh_async: refresh() blocks on disk I/O and would freeze the
+        # whole app if a drive is busy from an ongoing copy/move/sync.
         for panel in self.drive_panels:
-            panel.refresh()
+            panel.refresh_async()
 
     def _toggle_extra_drives(self):
         if self.extra_window.state() == "withdrawn":
