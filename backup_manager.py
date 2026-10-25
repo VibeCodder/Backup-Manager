@@ -1607,7 +1607,7 @@ class CopyLog(tk.Frame):
                  bg=BG2, padx=8).pack(anchor="w", pady=(6, 2))
         self.text = tk.Text(self, bg=BG, fg=TEXT, font=FONT_MONO,
                              relief="flat", bd=4, state="disabled", height=8,
-                             wrap="none")
+                             wrap="word")
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=vsb.set)
         self.text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
