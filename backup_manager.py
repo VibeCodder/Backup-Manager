@@ -6,6 +6,7 @@ Application for managing backups across multiple external drives
 import os
 import sys
 import shutil
+import stat
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -177,7 +178,7 @@ def open_path_in_explorer(path):
             subprocess.run(["xdg-open", path])
 
 def get_item_icon(path):
-    if os.path.isdir(path):
+    if os.path.isdir(lp(path)):
         return "📁"
     ext = Path(path).suffix.lower()
     icons = {
@@ -218,12 +219,261 @@ def styled_button(parent, text, command, color=ACCENT, width=None):
 
 
 # ─────────────────────────────────────────────
+# FILE-OPERATION HELPERS (rename / delete / move in drive panels)
+# ─────────────────────────────────────────────
+INVALID_NAME_CHARS = set('<>:"/\\|?*') if platform.system() == "Windows" else {"/"}
+
+def ask_text_dialog(parent, title, default="", select_len=None):
+    """Small dark modal dialog asking for one line of text. Returns the
+    stripped text, or None if cancelled / empty. select_len pre-selects only
+    the first N characters (used to skip the extension when renaming)."""
+    top = parent.winfo_toplevel()
+    dialog = tk.Toplevel(top)
+    dialog.title(title)
+    dialog.configure(bg=BG2)
+    dialog.resizable(False, False)
+    dialog.transient(top)
+    result = [None]
+
+    tk.Label(dialog, text=title + ":", font=FONT_BOLD, fg=TEXT,
+             bg=BG2).pack(padx=16, pady=(12, 4))
+    entry = tk.Entry(dialog, font=FONT_MAIN, bg=BG, fg=TEXT,
+                     insertbackground=TEXT, relief="flat", bd=4, width=44)
+    entry.insert(0, default)
+    entry.pack(padx=16, pady=4)
+    entry.select_range(0, select_len if select_len is not None else "end")
+
+    def ok(e=None):
+        result[0] = entry.get().strip() or None
+        dialog.destroy()
+
+    def cancel(e=None):
+        dialog.destroy()
+
+    btn_row = tk.Frame(dialog, bg=BG2)
+    btn_row.pack(pady=10)
+    tk.Button(btn_row, text="OK", command=ok, bg=ACCENT, fg=TEXT,
+              font=FONT_BOLD, relief="flat", padx=12, cursor="hand2").pack(side="left", padx=6)
+    tk.Button(btn_row, text="Cancel", command=cancel, bg=BG3, fg=TEXT_DIM,
+              font=FONT_BOLD, relief="flat", padx=12, cursor="hand2").pack(side="left")
+    entry.bind("<Return>", ok)
+    entry.bind("<Escape>", cancel)
+
+    dialog.update_idletasks()
+    try:
+        x = top.winfo_rootx() + (top.winfo_width() - dialog.winfo_reqwidth()) // 2
+        y = top.winfo_rooty() + (top.winfo_height() - dialog.winfo_reqheight()) // 3
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    except Exception:
+        pass
+    apply_dark_titlebar(dialog)
+    try:
+        dialog.wait_visibility()
+        dialog.grab_set()
+    except Exception:
+        pass
+    entry.focus_force()
+    dialog.wait_window()
+    return result[0]
+
+def lp(path):
+    """Long-path helper (Windows). Plain Win32 calls fail for paths of 260+
+    characters (MAX_PATH) unless the path carries the extended-length prefix
+    (backslash backslash question-mark backslash). Returns `path` unchanged
+    on other systems and for short paths, so only paths that really need it
+    are rewritten.
+
+    Rule used throughout the app: paths that are STORED / DISPLAYED / compared
+    stay in their normal form; lp() is applied only at the moment a path is
+    handed to os.* / open() / shutil.*."""
+    if os.name != "nt" or not isinstance(path, str) or not path:
+        return path
+    if path.startswith("\\\\?\\"):
+        return path
+    try:
+        full = os.path.abspath(path)
+    except Exception:
+        return path
+    if len(full) < 240:
+        return path
+    if full.startswith("\\\\"):                    # UNC share
+        return "\\\\?\\UNC\\" + full[2:]
+    return "\\\\?\\" + full
+
+
+def _rmtree_retry(func, path, *_):
+    """rmtree error handler: clear the read-only flag and retry once
+    (Windows refuses to delete read-only files, e.g. inside .git)."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+def remove_path(path):
+    """Permanently delete a file or a whole folder tree (long-path safe)."""
+    p = lp(path)
+    if os.path.isdir(p):
+        if _is_reparse(path):            # symlink / junction: remove only the link
+            try:
+                os.rmdir(p)
+            except OSError:
+                os.unlink(p)
+        elif sys.version_info >= (3, 12):
+            shutil.rmtree(p, onexc=_rmtree_retry)
+        else:
+            shutil.rmtree(p, onerror=_rmtree_retry)
+    else:
+        try:
+            os.remove(p)
+        except PermissionError:
+            os.chmod(p, stat.S_IWRITE)
+            os.remove(p)
+
+class OperationCancelled(BaseException):
+    """Raised inside a worker thread when the user pressed STOP ALL.
+    Derives from BaseException on purpose: the copy/move/sync code has many
+    `except Exception` blocks that must NOT swallow a cancellation."""
+
+
+def check_cancel(cancel):
+    if cancel is not None and cancel.is_set():
+        raise OperationCancelled()
+
+
+def _is_reparse(path):
+    """True for symlinks AND Windows junctions (never recurse into those
+    when deleting - that would wipe the link's target)."""
+    try:
+        st = os.lstat(lp(path))
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
+def copy_file_cancellable(src, dst, cancel, chunk=1024 * 1024):
+    """copy2() replacement that checks the cancel flag every chunk, so
+    even a multi-GB file can be interrupted. Partial target is removed.
+    Long-path safe (see lp)."""
+    s_, d_ = lp(src), lp(dst)
+    try:
+        with open(s_, "rb") as fsrc, open(d_, "wb") as fdst:
+            while True:
+                check_cancel(cancel)
+                buf = fsrc.read(chunk)
+                if not buf:
+                    break
+                fdst.write(buf)
+    except OperationCancelled:
+        try:
+            os.remove(d_)
+        except OSError:
+            pass
+        raise
+    try:
+        shutil.copystat(s_, d_)
+    except OSError:
+        pass
+
+
+def copytree_cancellable(src, dst, cancel):
+    """copytree() replacement: cancel checked before every entry/chunk.
+    Like shutil.copytree it keeps going after a single-file error and
+    raises shutil.Error with the collected errors at the end."""
+    errors = []
+    os.makedirs(lp(dst), exist_ok=True)
+    with os.scandir(lp(src)) as it:
+        entries = list(it)
+    for e in entries:
+        check_cancel(cancel)
+        sp = os.path.join(src, e.name)      # keep paths in normal form
+        d = os.path.join(dst, e.name)
+        try:
+            if e.is_dir():
+                copytree_cancellable(sp, d, cancel)
+            else:
+                copy_file_cancellable(sp, d, cancel)
+        except OSError as ex:
+            errors.append((sp, d, str(ex)))
+    try:
+        shutil.copystat(lp(src), lp(dst))
+    except OSError:
+        pass
+    if errors:
+        raise shutil.Error(errors)
+
+
+def remove_path_cancellable(path, cancel):
+    """remove_path() replacement that checks the cancel flag per entry."""
+    check_cancel(cancel)
+    p = lp(path)
+    if os.path.isdir(p) and not _is_reparse(path):
+        with os.scandir(p) as it:
+            entries = list(it)
+        for e in entries:
+            remove_path_cancellable(os.path.join(path, e.name), cancel)
+        try:
+            os.rmdir(p)
+        except PermissionError:
+            os.chmod(p, stat.S_IWRITE)
+            os.rmdir(p)
+    elif os.path.isdir(p):             # symlink / junction to a folder
+        try:
+            os.rmdir(p)
+        except OSError:
+            os.unlink(p)
+    else:
+        remove_path(path)
+
+
+def move_path(src, dst, cancel=None):
+    """shutil.move() replacement that is long-path safe: instant rename on
+    the same volume, otherwise copy + delete (like shutil.move does)."""
+    try:
+        os.rename(lp(src), lp(dst))
+        return
+    except OSError:
+        pass
+    if os.path.isdir(lp(src)):
+        copytree_cancellable(src, dst, cancel)
+    else:
+        copy_file_cancellable(src, dst, cancel)
+    remove_path(src)
+
+
+def same_volume(a, b):
+    try:
+        if platform.system() == "Windows":
+            return (os.path.splitdrive(os.path.abspath(a))[0].lower()
+                    == os.path.splitdrive(os.path.abspath(b))[0].lower())
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except Exception:
+        return False
+
+def _norm_path(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+# ─────────────────────────────────────────────
 # FILE TREE WIDGET (reused in multiple panels)
 # ─────────────────────────────────────────────
 class FileTree(tk.Frame):
     def __init__(self, parent, root_path="", on_select=None, readonly=False,
-                 on_new_folder=None, show_preview=False, **kwargs):
+                 on_new_folder=None, show_preview=False, editable=False,
+                 status_cb=None, **kwargs):
         super().__init__(parent, bg=BG2, **kwargs)
+        # editable=True enables: right-click menu (Rename / Delete), F2 / Del
+        # keys and drag & drop moving of (multi-)selected files and folders
+        # onto folders of this or any other editable tree (e.g. another drive).
+        self.editable = editable
+        self.status_cb = status_cb     # optional fn(msg, color) for progress text
+        self._busy = False
+        self._status_token = 0
+        self._hl = None                # current drop-highlight (see _set_highlight)
+        self._hl_key = None
+        if editable:
+            # constant 2px border that turns blue when this tree is a drop target
+            self.config(highlightthickness=2, highlightbackground=BG2,
+                        highlightcolor=BG2)
         self.show_preview = show_preview
         self._preview_path = None      # path currently shown in the preview
         self._preview_token = 0        # invalidates stale background loads
@@ -259,9 +509,10 @@ class FileTree(tk.Frame):
         tk.Button(toolbar, text="▶", command=lambda: self.load(self.path_var.get()),
                   bg=ACCENT, fg=TEXT, font=FONT_BOLD, relief="flat", bd=0,
                   padx=8, cursor="hand2").pack(side="left", padx=(0, 4))
-        tk.Button(toolbar, text="⬆", command=self.go_up,
+        self.btn_up = tk.Button(toolbar, text="⬆", command=self.go_up,
                   bg=BG3, fg=TEXT_DIM, font=FONT_BOLD, relief="flat", bd=0,
-                  padx=8, cursor="hand2").pack(side="left", padx=(0, 4))
+                  padx=8, cursor="hand2")
+        self.btn_up.pack(side="left", padx=(0, 4))
         tk.Button(toolbar, text="🔄", command=self.refresh,
                   bg=BG3, fg=TEXT_DIM, font=FONT_BOLD, relief="flat", bd=0,
                   padx=8, cursor="hand2").pack(side="left", padx=(0, 6))
@@ -287,6 +538,7 @@ class FileTree(tk.Frame):
         self.tree.column("modified", width=130, minwidth=100)
 
         self._style_tree()
+        self.tree.tag_configure("droptarget", background="#1e40af", foreground=TEXT)
 
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
@@ -362,6 +614,9 @@ class FileTree(tk.Frame):
 
     def _setup_dnd(self):
         """Enable drag and drop via tkinterdnd2 if available, fallback gracefully."""
+        if self.editable:
+            self._setup_editing()
+            return
         self.tree.bind("<ButtonPress-1>", self._drag_start)
         self.tree.bind("<B1-Motion>", self._drag_motion)
         self.tree.bind("<ButtonRelease-1>", self._drag_end)
@@ -383,20 +638,466 @@ class FileTree(tk.Frame):
     def _drag_end(self, event):
         self._drag_data["dragging"] = False
 
+    # ══════════════════════════════════════════
+    # EDITING (only when editable=True): context menu, rename, delete,
+    # drag & drop move
+    # ══════════════════════════════════════════
+    def _setup_editing(self):
+        t = self.tree
+        t.bind("<Button-3>", self._context_menu)
+        t.bind("<F2>", lambda e: self.rename_selected())
+        t.bind("<Delete>", lambda e: self.delete_selected())
+        t.bind("<Control-a>", self._select_all)
+        t.bind("<Escape>", self._dd_cancel)
+        t.bind("<ButtonPress-1>", self._dd_press)
+        t.bind("<B1-Motion>", self._dd_motion)
+        t.bind("<ButtonRelease-1>", self._dd_release)
+        self._dd = {"pressed": False, "dragging": False}
+
+    def _select_all(self, event=None):
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
+
+    def _status(self, msg, color=TEXT_DIM, clear_after=None):
+        if not self.status_cb:
+            return
+        try:
+            self.status_cb(msg, color)
+            if clear_after:
+                self._status_token += 1
+                tok = self._status_token
+                self.after(clear_after,
+                           lambda: self._status_token == tok and self.status_cb("", TEXT_DIM))
+        except Exception:
+            pass  # widget destroyed
+
+    def _msg_parent(self):
+        return self.winfo_toplevel()
+
+    # ── Right-click menu ──────────────────────
+    def _context_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        # If the right-clicked row isn't part of the selection, select just it.
+        if item not in self.tree.selection():
+            self.tree.selection_set(item)
+        self.tree.focus(item)
+        paths = self.get_selected_paths()
+        if not paths:
+            return
+        menu = tk.Menu(self, tearoff=0, bg=BG2, fg=TEXT,
+                       activebackground=ACCENT, activeforeground=TEXT,
+                       relief="flat", bd=0)
+        if len(paths) == 1:
+            menu.add_command(label="✎  Rename\tF2", command=self.rename_selected)
+            menu.add_separator()
+        label = "✕  Delete\tDel" if len(paths) == 1 else f"✕  Delete {len(paths)} items\tDel"
+        menu.add_command(label=label, command=self.delete_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ── Rename ────────────────────────────────
+    def rename_selected(self):
+        paths = self.get_selected_paths()
+        if len(paths) != 1 or self._busy:
+            return
+        src = paths[0]
+        old_name = os.path.basename(src)
+        stem_len = None if os.path.isdir(lp(src)) else len(os.path.splitext(old_name)[0])
+        new_name = ask_text_dialog(self, "New name", old_name, select_len=stem_len)
+        if not new_name or new_name == old_name:
+            return
+        if any(c in INVALID_NAME_CHARS for c in new_name):
+            bad = " ".join(sorted(INVALID_NAME_CHARS))
+            messagebox.showerror("Rename", f"Name can't contain: {bad}",
+                                 parent=self._msg_parent())
+            return
+        new_path = os.path.join(os.path.dirname(src), new_name)
+        # A pure case change (foo -> Foo) "exists" on Windows but is allowed.
+        if os.path.lexists(lp(new_path)) and _norm_path(new_path) != _norm_path(src):
+            messagebox.showerror("Rename", f"'{new_name}' already exists in this folder.",
+                                 parent=self._msg_parent())
+            return
+        try:
+            os.rename(lp(src), lp(new_path))
+        except Exception as e:
+            messagebox.showerror("Rename", f"Could not rename:\n{e}",
+                                 parent=self._msg_parent())
+            return
+        self._status(f"✔ Renamed: {old_name} → {new_name}", GREEN, 6000)
+        self.refresh_async(on_done=lambda: self.select_paths([new_path]))
+
+    # ── Delete ────────────────────────────────
+    def delete_selected(self):
+        paths = self.get_selected_paths()
+        if not paths or self._busy:
+            return
+        names = [os.path.basename(p) for p in paths]
+        msg = f"Delete {len(names)} item(s)?\n\n" + "\n".join(names[:8])
+        if len(names) > 8:
+            msg += f"\n... and {len(names) - 8} more"
+        msg += "\n\n⚠ Permanently — NOT sent to the Recycle Bin. This can't be undone."
+        if not messagebox.askyesno("Confirm delete", msg, icon="warning",
+                                   default="no", parent=self._msg_parent()):
+            return
+
+        def work():
+            ok, errs = 0, []
+            for p in paths:
+                try:
+                    remove_path(p)
+                    ok += 1
+                except Exception as e:
+                    errs.append(f"{os.path.basename(p)}: {e}")
+            return ok, errs
+
+        def done(res):
+            ok, errs = res
+            self.refresh_async()
+            if errs:
+                self._status(f"✘ Deleted {ok}, {len(errs)} failed", RED, 8000)
+                messagebox.showerror("Delete", "Could not delete:\n\n" + "\n".join(errs[:8]),
+                                     parent=self._msg_parent())
+            else:
+                self._status(f"✔ Deleted {ok} item(s)", GREEN, 6000)
+
+        self._status("⏳ Deleting...", ORANGE)
+        self._run_bg(work, done)
+
+    def _run_bg(self, work, done):
+        """Run work() on a worker thread, then done(result) on the main thread."""
+        self._busy = True
+
+        def runner():
+            try:
+                res = work()
+            except Exception as e:
+                res = (0, [str(e)])
+            try:
+                self.after(0, lambda: finish(res))
+            except Exception:
+                pass  # widget destroyed meanwhile
+
+        def finish(res):
+            self._busy = False
+            done(res)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    # ── Move (target of drag & drop) ──────────
+    @staticmethod
+    def _movable(paths, dest):
+        """Filter out sources that are already in dest, or that are dest itself /
+        one of dest's ancestors (can't move a folder into itself)."""
+        nd = _norm_path(dest)
+        out = []
+        for p in paths:
+            np_ = _norm_path(p)
+            if _norm_path(os.path.dirname(p)) == nd:
+                continue
+            if nd == np_ or nd.startswith(np_.rstrip("\\/") + os.sep):
+                continue
+            out.append(p)
+        return out
+
+    def _move_items(self, paths, dest_dir, dest_tree):
+        if self._busy:
+            return
+        paths = self._movable(paths, dest_dir)
+        if not paths:
+            return
+        parent = self._msg_parent()
+        if not os.path.isdir(lp(dest_dir)):
+            messagebox.showerror("Move", f"Target folder not found:\n{dest_dir}", parent=parent)
+            return
+
+        if any(not same_volume(p, dest_dir) for p in paths):
+            if not messagebox.askyesno(
+                    "Move to another drive",
+                    f"Move {len(paths)} item(s) to another drive?\n\n→ {dest_dir}\n\n"
+                    "They will be copied there and then deleted from the original "
+                    "location. This can take a while.",
+                    default="no", parent=parent):
+                return
+
+        plan = []   # (src, target, replace)
+        for src in paths:
+            name = os.path.basename(src)
+            target = os.path.join(dest_dir, name)
+            replace = False
+            if os.path.lexists(lp(target)):
+                if _norm_path(src).startswith(_norm_path(target).rstrip("\\/") + os.sep):
+                    messagebox.showerror(
+                        "Move", f"Can't replace '{name}': the item you're moving is inside it.",
+                        parent=parent)
+                    continue
+                ans = messagebox.askyesnocancel(
+                    "Name conflict",
+                    f"'{name}' already exists in:\n{dest_dir}\n\n"
+                    "Yes  = replace it (the existing one is deleted)\n"
+                    "No   = skip this item\n"
+                    "Cancel = abort the whole move",
+                    icon="warning", parent=parent)
+                if ans is None:
+                    return
+                if not ans:
+                    continue
+                replace = True
+            plan.append((src, target, replace))
+        if not plan:
+            return
+
+        def work():
+            ok, errs = 0, []
+            for src, target, replace in plan:
+                try:
+                    if replace:
+                        remove_path(target)
+                    move_path(src, target)
+                    ok += 1
+                except Exception as e:
+                    errs.append(f"{os.path.basename(src)}: {e}")
+            return ok, errs
+
+        def done(res):
+            ok, errs = res
+            self.refresh_async()
+            if dest_tree is not self:
+                dest_tree.refresh_async()
+            dname = os.path.basename(dest_dir.rstrip("\\/")) or dest_dir
+            if errs:
+                self._status(f"✘ Moved {ok}, {len(errs)} failed", RED, 8000)
+                messagebox.showerror("Move", "Could not move:\n\n" + "\n".join(errs[:8]),
+                                     parent=self._msg_parent())
+            else:
+                self._status(f"✔ Moved {ok} item(s) → {dname}", GREEN, 6000)
+
+        self._status("⏳ Moving...", ORANGE)
+        self._run_bg(work, done)
+
+    # ── Drag & drop (mouse driven, multi-selection aware) ──
+    def _dd_press(self, event):
+        tree = self.tree
+        region = tree.identify_region(event.x, event.y)
+        item = tree.identify_row(event.y) if region in ("tree", "cell") else ""
+        ctrl = bool(event.state & 0x0004)
+        shift = bool(event.state & 0x0001)
+        selected = tree.selection()
+        # Pressing on an already-selected row of a multi-selection must NOT
+        # collapse the selection yet (it might become a drag) — decide on release.
+        defer = bool(item) and not ctrl and not shift and item in selected and len(selected) > 1
+        self._dd = {"pressed": bool(item), "dragging": False, "cancelled": False,
+                    "x": event.x_root, "y": event.y_root, "ghost": None,
+                    "ghost_lbl": None, "paths": [], "label": "",
+                    "defer_item": item if defer else None}
+        tree.focus_set()
+        if defer:
+            return "break"
+
+    def _dd_motion(self, event):
+        d = self._dd
+        block = "break" if d.get("defer_item") else None
+        if not d.get("pressed") or d.get("cancelled"):
+            return block
+        if not d["dragging"]:
+            if abs(event.x_root - d["x"]) < 8 and abs(event.y_root - d["y"]) < 8:
+                return block
+            paths = self.get_selected_paths()
+            if not paths:
+                return block
+            d["dragging"] = True
+            d["paths"] = paths
+            d["label"] = os.path.basename(paths[0]) if len(paths) == 1 else f"{len(paths)} items"
+            ghost = tk.Toplevel(self)
+            ghost.overrideredirect(True)
+            try:
+                ghost.attributes("-topmost", True)
+                ghost.attributes("-alpha", 0.9)
+            except Exception:
+                pass
+            lbl = tk.Label(ghost, text=f"📦  {d['label']}", bg="#475569", fg=TEXT,
+                           font=FONT_BOLD, padx=10, pady=5)
+            lbl.pack()
+            d["ghost"], d["ghost_lbl"] = ghost, lbl
+
+        try:
+            d["ghost"].geometry(f"+{event.x_root + 14}+{event.y_root + 10}")
+        except Exception:
+            pass
+        target = self._resolve_drop(event.x_root, event.y_root)
+        valid = bool(target) and bool(self._movable(d["paths"], target["dest"]))
+        self._set_highlight(target if valid else None)
+        try:
+            if valid:
+                dname = os.path.basename(target["dest"].rstrip("\\/")) or target["dest"]
+                d["ghost_lbl"].config(text=f"📦  {d['label']}  →  {dname}", bg=ACCENT)
+            else:
+                d["ghost_lbl"].config(text=f"📦  {d['label']}", bg="#475569")
+        except Exception:
+            pass
+        return block
+
+    def _dd_release(self, event):
+        d = self._dd
+        block = "break" if d.get("defer_item") else None
+        if d.get("dragging"):
+            target = None if d.get("cancelled") else self._resolve_drop(event.x_root, event.y_root)
+            paths = d.get("paths", [])
+            self._dd_cleanup()
+            if target:
+                movable = self._movable(paths, target["dest"])
+                if movable:
+                    # let the button-release finish before any dialog grabs input
+                    self.after(20, lambda: self._move_items(movable, target["dest"], target["ft"]))
+        elif d.get("pressed") and d.get("defer_item") and not d.get("cancelled"):
+            # plain click on a multi-selected row -> collapse to that row
+            self.tree.selection_set(d["defer_item"])
+            self.tree.focus(d["defer_item"])
+        self._dd = {"pressed": False, "dragging": False}
+        return block
+
+    def _dd_cancel(self, event=None):
+        d = getattr(self, "_dd", None)
+        if d and d.get("dragging"):
+            d["cancelled"] = True
+            self._dd_cleanup()
+
+    def _dd_cleanup(self):
+        d = self._dd
+        self._clear_highlight()
+        if d.get("ghost") is not None:
+            try:
+                d["ghost"].destroy()
+            except Exception:
+                pass
+            d["ghost"] = None
+
+    def _resolve_drop(self, x_root, y_root):
+        """What is under the mouse? Returns {"ft", "dest", "mode", "row", "widget"}
+        or None. Modes: "row" = a folder row, "parent" = the ◀/⬆ buttons (move
+        to the parent folder), "current" = anywhere else in a tree (its current folder)."""
+        try:
+            origin = self.winfo_containing(x_root, y_root)
+        except Exception:
+            return None
+        w, ft = origin, None
+        while w is not None:
+            if isinstance(w, FileTree) and w.editable:
+                ft = w
+                break
+            w = getattr(w, "master", None)
+        if ft is None or not ft.root_path:
+            return None
+        dest, mode, row, widget = None, "current", None, None
+        if origin is ft.tree:
+            rx = x_root - ft.tree.winfo_rootx()
+            ry = y_root - ft.tree.winfo_rooty()
+            if ft.tree.identify_region(rx, ry) in ("tree", "cell"):
+                r = ft.tree.identify_row(ry)
+                p = getattr(ft.tree, "_item_paths", {}).get(r) if r else None
+                if p and "dir" in ft.tree.item(r, "tags"):
+                    dest, mode, row = p, "row", r
+        elif origin in (ft.btn_back, ft.btn_up):
+            parent = str(Path(ft.root_path).parent)
+            if parent == ft.root_path:
+                return None
+            dest, mode, widget = parent, "parent", origin
+        if dest is None:
+            dest = ft.root_path
+        return {"ft": ft, "dest": dest, "mode": mode, "row": row, "widget": widget}
+
+    def _set_highlight(self, target):
+        key = None
+        if target:
+            key = (id(target["ft"]), target["mode"], target["row"], str(target["widget"]))
+        if key == self._hl_key:
+            return
+        self._clear_highlight()
+        if not target:
+            return
+        ft, mode = target["ft"], target["mode"]
+        try:
+            if mode == "row":
+                tags = [t for t in ft.tree.item(target["row"], "tags") if t != "droptarget"]
+                ft.tree.item(target["row"], tags=tags + ["droptarget"])
+            elif mode == "parent":
+                target["widget"].config(bg=ACCENT)
+            else:
+                ft.config(highlightbackground=ACCENT2, highlightcolor=ACCENT2)
+        except tk.TclError:
+            return
+        self._hl = target
+        self._hl_key = key
+
+    def _clear_highlight(self):
+        t, self._hl, self._hl_key = self._hl, None, None
+        if not t:
+            return
+        ft = t["ft"]
+        try:
+            if t["mode"] == "row":
+                tags = [x for x in ft.tree.item(t["row"], "tags") if x != "droptarget"]
+                ft.tree.item(t["row"], tags=tags)
+            elif t["mode"] == "parent":
+                t["widget"].config(bg=BG3)
+            else:
+                ft.config(highlightbackground=BG2, highlightcolor=BG2)
+        except tk.TclError:
+            pass  # row/widget no longer exists
+
+    def select_paths(self, paths):
+        wanted = {_norm_path(p) for p in paths}
+        items = [i for i, p in getattr(self.tree, "_item_paths", {}).items()
+                 if _norm_path(p) in wanted]
+        if items:
+            self.tree.selection_set(items)
+            self.tree.focus(items[0])
+            self.tree.see(items[0])
+
+    def refresh_async(self, on_done=None):
+        """Re-list the current folder on a worker thread (never blocks the UI),
+        then repopulate on the main thread. Skipped if the user navigated
+        elsewhere in the meantime."""
+        path = self.root_path
+        if not path:
+            return
+
+        def worker():
+            entries = self.list_directory(path)
+            try:
+                self.after(0, lambda: apply(entries))
+            except Exception:
+                pass
+
+        def apply(entries):
+            if entries is None or self.root_path != path:
+                return
+            self.apply_entries(path, entries)
+            if on_done:
+                on_done()
+
+        threading.Thread(target=worker, daemon=True).start()
+
     @staticmethod
     def list_directory(path):
         """Pure disk I/O — safe to call from a background thread. Returns a
         list of (full_path, name, is_dir, size_str, mtime_str) tuples, or
         None if the path is missing/unreadable. Does not touch any widget."""
-        if not path or not os.path.exists(path):
+        if not path or not os.path.exists(lp(path)):
             return None
         try:
-            items = sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))
-        except PermissionError:
+            items = sorted(os.scandir(lp(path)), key=lambda e: (not e.is_dir(), e.name.lower()))
+        except OSError:          # PermissionError, path too long, drive gone...
             return None
         result = []
         for entry in items:
-            icon_path = entry.path
+            # Built from the NORMAL path (not entry.path, which would carry
+            # the extended-length prefix for long folders) so selection/queue/compare
+            # logic keeps working with ordinary paths.
+            icon_path = os.path.join(path, entry.name)
             try:
                 stat = entry.stat()
                 size = format_size(stat.st_size) if entry.is_file() else ""
@@ -428,7 +1129,7 @@ class FileTree(tk.Frame):
             self.tree._item_paths[iid] = full_path
 
     def load(self, path, _from_history=False):
-        if not path or not os.path.exists(path):
+        if not path or not os.path.exists(lp(path)):
             return
         entries = self.list_directory(path)
         if entries is None:
@@ -446,7 +1147,7 @@ class FileTree(tk.Frame):
     def _on_double_click(self, event):
         item = self.tree.focus()
         path = getattr(self.tree, "_item_paths", {}).get(item)
-        if path and os.path.isdir(path):
+        if path and os.path.isdir(lp(path)):
             self.load(path)
 
     def _on_select(self, event):
@@ -498,7 +1199,7 @@ class FileTree(tk.Frame):
             focus = self.tree.focus()
             iid = focus if focus in sel else sel[-1]
             path = getattr(self.tree, "_item_paths", {}).get(iid)
-        if (path and os.path.isfile(path)
+        if (path and os.path.isfile(lp(path))
                 and Path(path).suffix.lower() in IMAGE_EXTS):
             if path != self._preview_path:
                 self._preview_request(path)
@@ -544,7 +1245,7 @@ class FileTree(tk.Frame):
     def _preview_worker(self, path, size, token):
         """Background thread: disk I/O + decoding + resizing (no Tk calls)."""
         try:
-            img = Image.open(path)
+            img = Image.open(lp(path))
             orig_w, orig_h = img.size
             fmt = img.format or ""
             try:
@@ -563,7 +1264,7 @@ class FileTree(tk.Frame):
             bg.alpha_composite(img)
             img = bg.convert("RGB")
             try:
-                fsize = format_size(os.path.getsize(path))
+                fsize = format_size(os.path.getsize(lp(path)))
             except Exception:
                 fsize = ""
             info = f"{os.path.basename(path)}\n{orig_w} × {orig_h} px"
@@ -696,7 +1397,8 @@ class DrivePanel(tk.Frame):
                          troughcolor=BG3, background=ACCENT2, thickness=8)
 
         # File tree
-        self.file_tree = FileTree(self, root_path=self.drive_path, readonly=True)
+        self.file_tree = FileTree(self, root_path=self.drive_path, readonly=True,
+                                  editable=True, status_cb=self.set_status)
         self.file_tree.pack(fill="both", expand=True, padx=4, pady=4)
 
         # Path bar — always shows the current folder relative to the drive
@@ -944,6 +1646,9 @@ class ControlPanel(tk.Toplevel):
         self.update_idletasks()
         apply_dark_titlebar(self)
         self._copying = False
+        self._op_gen = 0              # bumped per operation / force-release
+        self._op_cancel = None        # threading.Event of the running operation
+        self._stop_requested = False
         # Favorites: list of {"name": str, "path": str}
         if "favorites" not in self.config:
             self.config["favorites"] = []
@@ -1117,12 +1822,22 @@ class ControlPanel(tk.Toplevel):
         self.delete_btn = styled_button(btn_frame, "🗑  DELETE from drives",
                       self._delete_selected, RED)
         self.delete_btn.pack(side="left", padx=(0, 6))
-        styled_button(btn_frame, "🔄 SYNC folder",
-                      self._sync_all, ORANGE).pack(side="left", padx=(0, 6))
+        self.sync_btn = styled_button(btn_frame, "🔄 SYNC folder",
+                                      self._sync_all, ORANGE)
+        self.sync_btn.pack(side="left", padx=(0, 6))
         self.progress_var = tk.DoubleVar()
         self.prog_bar = ttk.Progressbar(btn_frame, variable=self.progress_var,
                                          maximum=100, length=150, mode="determinate")
         self.prog_bar.pack(side="right", padx=6)
+        # STOP ALL — sits left of the progress bar; only active while an
+        # operation runs (see _set_ops_ui / _stop_all).
+        self.stop_btn = tk.Button(
+            btn_frame, text="⛔  STOP ALL", command=self._stop_all,
+            bg=BG3, fg=TEXT_DIM, disabledforeground=TEXT_DIM,
+            activebackground="#b91c1c", activeforeground=TEXT,
+            font=FONT_BOLD, relief="flat", bd=0, padx=12, pady=6,
+            state="disabled")
+        self.stop_btn.pack(side="right", padx=6)
 
         # ── Log ──────────────────────────────
         self.log = CopyLog(self)
@@ -1638,8 +2353,8 @@ class ControlPanel(tk.Toplevel):
         """Rebuild the listbox display and update _selected_paths."""
         self.queue_listbox.delete(0, "end")
         for p in self._queue_items:
-            icon = "📁" if os.path.isdir(p) else get_item_icon(p)
-            exists = os.path.exists(p)
+            icon = "📁" if os.path.isdir(lp(p)) else get_item_icon(p)
+            exists = os.path.exists(lp(p))
             self.queue_listbox.insert("end", f"  {icon}  {p}")
             self.queue_listbox.itemconfig("end",
                 fg=TEXT if exists else RED)
@@ -1851,11 +2566,11 @@ class ControlPanel(tk.Toplevel):
             return
         parent_dir = os.path.dirname(src)
         new_src = os.path.join(parent_dir, new_name)
-        if os.path.exists(new_src):
+        if os.path.exists(lp(new_src)):
             messagebox.showerror("Rename", f"'{new_name}' already exists in this folder.")
             return
         try:
-            os.rename(src, new_src)
+            os.rename(lp(src), lp(new_src))
             self.log.log(f"✎ Renamed source: {old_name} → {new_name}", "ok")
         except Exception as e:
             self.log.log(f"✘ Rename error (source) {old_name}: {e}", "err")
@@ -1868,14 +2583,11 @@ class ControlPanel(tk.Toplevel):
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
             old_target = os.path.join(dest_folder, old_name)
             new_target = os.path.join(dest_folder, new_name)
-            if os.path.exists(old_target):
+            if os.path.exists(lp(old_target)):
                 try:
-                    if os.path.exists(new_target):
-                        if os.path.isdir(new_target):
-                            shutil.rmtree(new_target)
-                        else:
-                            os.remove(new_target)
-                    os.rename(old_target, new_target)
+                    if os.path.exists(lp(new_target)):
+                        remove_path(new_target)
+                    os.rename(lp(old_target), lp(new_target))
                     self.log.log(f"✎ Renamed on Drive {drive_idx+1}: {old_name} → {new_name}", "ok")
                 except Exception as e:
                     self.log.log(f"✘ Rename error on Drive {drive_idx+1}: {e}", "err")
@@ -1904,10 +2616,8 @@ class ControlPanel(tk.Toplevel):
         for src in paths:
             name = os.path.basename(src)
             try:
-                if os.path.isdir(src):
-                    shutil.rmtree(src)
-                elif os.path.isfile(src):
-                    os.remove(src)
+                if os.path.isdir(lp(src)) or os.path.isfile(lp(src)):
+                    remove_path(src)
                 removed += 1
                 self.log.log(f"🗑 {name} removed from source", "warn")
             except Exception as e:
@@ -1919,11 +2629,11 @@ class ControlPanel(tk.Toplevel):
                 dest_folder = os.path.join(drive_root, rel) if rel else drive_root
                 target = os.path.join(dest_folder, name)
                 try:
-                    if os.path.isdir(target):
-                        shutil.rmtree(target)
+                    if os.path.isdir(lp(target)):
+                        remove_path(target)
                         self.log.log(f"🗑 {name} removed from Drive {drive_idx+1}", "warn")
-                    elif os.path.isfile(target):
-                        os.remove(target)
+                    elif os.path.isfile(lp(target)):
+                        remove_path(target)
                         self.log.log(f"🗑 {name} removed from Drive {drive_idx+1}", "warn")
                 except Exception as e:
                     self.log.log(f"✘ Remove error {name} on Drive {drive_idx+1}: {e}", "err")
@@ -1940,7 +2650,7 @@ class ControlPanel(tk.Toplevel):
         and mirror it into the same relative location on every active
         destination drive."""
         current_dir = self.source_tree.root_path
-        if not current_dir or not os.path.isdir(current_dir):
+        if not current_dir or not os.path.isdir(lp(current_dir)):
             messagebox.showerror("New folder", "No valid source folder is open.")
             return
         name = self._ask_name("New folder name", "New Folder")
@@ -1952,12 +2662,12 @@ class ControlPanel(tk.Toplevel):
             return
 
         new_path = os.path.join(current_dir, name)
-        if os.path.exists(new_path):
+        if os.path.exists(lp(new_path)):
             messagebox.showerror("New folder", f"'{name}' already exists here.")
             return
 
         try:
-            os.makedirs(new_path)
+            os.makedirs(lp(new_path))
             self.log.log(f"📁 Created folder: {name} (source)", "ok")
         except Exception as e:
             self.log.log(f"✘ Could not create folder (source): {e}", "err")
@@ -1971,7 +2681,7 @@ class ControlPanel(tk.Toplevel):
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
             target = os.path.join(dest_folder, name)
             try:
-                os.makedirs(target, exist_ok=True)
+                os.makedirs(lp(target), exist_ok=True)
                 created += 1
                 self.log.log(f"📁 Created folder: {name} → Drive {drive_idx+1}", "ok")
             except Exception as e:
@@ -2041,11 +2751,131 @@ class ControlPanel(tk.Toplevel):
         user is interacting with the UI at the same time (e.g. browsing
         folders). Everything that touches a widget from _do_copy/_do_move/
         _do_sync/_do_eject must go through here instead — same pattern as
-        _availability_worker uses via its queue."""
+        _availability_worker uses via its queue.
+
+        Calls from a worker that was force-released (STOP ALL pressed twice)
+        are dropped, so a thread that wakes up later can't scribble over the
+        UI of a newer operation."""
+        gen = getattr(threading.current_thread(), "op_gen", None)
+        if gen is not None and gen != self._op_gen:
+            return
         try:
             self.after(0, lambda: fn(*args, **kwargs))
         except Exception:
             pass  # widget destroyed
+
+    # ── Operation runner / STOP ALL ───────────
+    def _cur_cancel(self):
+        """Cancel flag of the operation running on the CURRENT worker thread."""
+        return getattr(threading.current_thread(), "cancel_event", None) or threading.Event()
+
+    def _set_ops_ui(self, running):
+        for b in (self.copy_btn, self.move_btn, self.delete_btn, self.sync_btn):
+            b.config(state="disabled" if running else "normal")
+        if running:
+            self.stop_btn.config(state="normal", text="⛔  STOP ALL",
+                                 bg="#dc2626", fg=TEXT, cursor="hand2")
+        else:
+            self.stop_btn.config(state="disabled", text="⛔  STOP ALL",
+                                 bg=BG3, fg=TEXT_DIM, cursor="arrow")
+
+    def _start_op(self, target, *args):
+        """Run target(*args) on a worker thread with a cancel flag, and
+        finalise the UI (buttons, statuses, refresh) in ONE place."""
+        self._op_gen += 1
+        gen = self._op_gen
+        cancel = threading.Event()
+        self._op_cancel = cancel
+        self._stop_requested = False
+        self._copying = True
+        self.progress_var.set(0)
+        self._set_ops_ui(True)
+
+        def runner():
+            th = threading.current_thread()
+            th.op_gen = gen
+            th.cancel_event = cancel
+            outcome, payload = "done", None
+            try:
+                payload = target(*args)
+            except OperationCancelled:
+                outcome = "cancelled"
+            except Exception as e:
+                outcome, payload = "error", e
+            try:
+                self.after(0, lambda: self._finish_op(gen, outcome, payload))
+            except Exception:
+                pass  # widget destroyed
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def _mark_interrupted_panels(self):
+        for p in self.drive_panels:
+            if p.op_status_var.get().startswith("⏳"):
+                p.set_status("⛔ Stopped", ORANGE)
+
+    def _finish_op(self, gen, outcome, payload):
+        if gen != self._op_gen:
+            return      # this worker was force-released earlier — ignore it
+        self._copying = False
+        self._op_cancel = None
+        self._stop_requested = False
+        self._set_ops_ui(False)
+        if outcome == "cancelled":
+            self.progress_var.set(0)
+            self._mark_interrupted_panels()
+            self.log.log("⛔ Operation stopped by user.", "warn")
+        elif outcome == "error":
+            self.progress_var.set(0)
+            self._mark_interrupted_panels()
+            self.log.log(f"✘ Operation failed: {payload}", "err")
+        else:
+            self.progress_var.set(100)
+        for p in self.drive_panels:
+            p.refresh_async()
+        try:
+            self.source_tree.refresh()
+        except Exception:
+            pass
+        if outcome == "done" and payload:
+            messagebox.showinfo(*payload)
+
+    def _stop_all(self):
+        """1st click: ask the worker to stop (checked between files and
+        every 1 MB while copying a file). 2nd click (FORCE STOP): release
+        the UI immediately even if the worker is stuck inside a blocking
+        call on a hung drive."""
+        if not self._copying or self._op_cancel is None:
+            return
+        if not self._stop_requested:
+            self._stop_requested = True
+            self._op_cancel.set()
+            self.log.log("⛔ Stop requested – finishing the current chunk…", "warn")
+            self.stop_btn.config(text="⚠  FORCE STOP", bg="#7f1d1d")
+            gen = self._op_gen
+            self.after(4000, lambda: self._stop_hint(gen))
+        else:
+            self._force_release()
+
+    def _stop_hint(self, gen):
+        if gen == self._op_gen and self._copying and self._stop_requested:
+            self.log.log("Still stopping – a drive is probably not responding. "
+                         "Press FORCE STOP to release the app.", "warn")
+
+    def _force_release(self):
+        self._op_gen += 1               # orphan the stuck worker thread
+        if self._op_cancel is not None:
+            self._op_cancel.set()       # it exits as soon as it wakes up
+        self._op_cancel = None
+        self._copying = False
+        self._stop_requested = False
+        self._set_ops_ui(False)
+        self.progress_var.set(0)
+        self._mark_interrupted_panels()
+        self.log.log("⚠ FORCE STOP: the app was released, but the worker is "
+                     "blocked in a drive I/O call. Check the drive/cable, use "
+                     "Refresh Drives, and avoid starting a new copy to the "
+                     "same drive until it responds again.", "err")
 
     def _clear_all_drive_statuses(self):
         """Clear the operation-status text ('✔ Done', '✔ Synced', ...) on
@@ -2075,65 +2905,56 @@ class ControlPanel(tk.Toplevel):
         if not drives:
             messagebox.showerror("No drives", "No active destination drives.")
             return
-        threading.Thread(target=self._do_copy, args=(paths, drives), daemon=True).start()
+        self._start_op(self._do_copy, paths, drives)
 
     def _do_copy(self, src_paths, drives):
-        # NOTE: this runs in a background thread. No Tk widget may be
-        # touched directly here — everything UI-related goes through
-        # self._ui(...), which marshals it onto the main thread.
-        # refresh_async() is the exception: it's designed to be called from
-        # any thread (it only spawns its own worker + schedules the actual
-        # widget update via after()), so it's called directly, not via _ui.
-        self._copying = True
-        self._ui(self.copy_btn.config, state="disabled")
+        # Runs on a worker thread started by _start_op (which already set
+        # _copying / disabled buttons and finalises the UI afterwards).
+        # No Tk widget may be touched directly — use self._ui(...).
+        cancel = self._cur_cancel()
         self._clear_all_drive_statuses()
         total = len(src_paths) * len(drives)
         done  = 0
         self._ui(self.log.log, f"Copying: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
         for drive_idx, drive_root in drives:
+            check_cancel(cancel)
             panel = self.drive_panels[drive_idx]
             self._ui(panel.set_status, "⏳ Copying...", ORANGE)
             rel = panel.relative_subpath
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
-            os.makedirs(dest_folder, exist_ok=True)
+            os.makedirs(lp(dest_folder), exist_ok=True)
             last_refresh = 0
             for src in src_paths:
+                check_cancel(cancel)
                 if not src:
                     continue
                 name = os.path.basename(src)
                 dest = os.path.join(dest_folder, name)
                 try:
-                    if os.path.isdir(src):
-                        if os.path.exists(dest):
-                            shutil.rmtree(dest)
-                        shutil.copytree(src, dest)
+                    if os.path.isdir(lp(src)):
+                        if os.path.exists(lp(dest)):
+                            remove_path_cancellable(dest, cancel)
+                        copytree_cancellable(src, dest, cancel)
                     else:
-                        shutil.copy2(src, dest)
+                        copy_file_cancellable(src, dest, cancel)
                     self._ui(self.log.log, f"✔ {name} → Drive {drive_idx+1}", "ok")
+                except OperationCancelled:
+                    self._ui(self.log.log,
+                             f"⛔ Interrupted while copying {name} → Drive {drive_idx+1} "
+                             f"(an incomplete copy may remain there)", "warn")
+                    raise
                 except Exception as e:
                     self._ui(self.log.log, f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
                 done += 1
                 self._ui(self.progress_var.set, (done / total) * 100)
-                # Live view update — throttled so we're not spawning a
-                # refresh thread per file, but the panel visibly fills in
-                # as items land instead of staying static until the very end.
                 now = time.time()
                 if now - last_refresh > 0.75:
                     panel.refresh_async()
                     last_refresh = now
             self._ui(panel.set_status, "✔ Done", GREEN)
             panel.refresh_async()
-        # Keep the Control Panel's own file preview in sync too — it can be
-        # pointed at one of the drives (source mode "drive{i}"), and until
-        # now only the drive-panel grid in the main BackupFlow window
-        # refreshed after a copy; this preview was left showing stale
-        # contents until the user manually navigated away and back.
-        self._ui(self.source_tree.refresh)
-        self._ui(self.progress_var.set, 100)
         self._ui(self.log.log, "Copy complete!", "ok")
-        self._copying = False
-        self._ui(self.copy_btn.config, state="normal")
-        self._ui(messagebox.showinfo, "Done", "Copy completed successfully!")
+        return ("Done", "Copy completed successfully!")
 
     def _move_selected(self):
         if self._copying:
@@ -2161,13 +2982,12 @@ class ControlPanel(tk.Toplevel):
         msg += "\n\n⚠ Original files will be REMOVED from the source after copying."
         if not messagebox.askyesno("Confirm move", msg):
             return
-        threading.Thread(target=self._do_move, args=(paths, drives), daemon=True).start()
+        self._start_op(self._do_move, paths, drives)
 
     def _do_move(self, src_paths, drives):
-        # Background thread — all Tk access goes through self._ui(...).
-        self._copying = True
-        self._ui(self.copy_btn.config, state="disabled")
-        self._ui(self.move_btn.config, state="disabled")
+        # Worker thread (see _do_copy). Originals are removed ONLY after every
+        # copy finished, so stopping during the copy phase never loses data.
+        cancel = self._cur_cancel()
         self._clear_all_drive_statuses()
         total = len(src_paths) * len(drives)
         done = 0
@@ -2175,35 +2995,42 @@ class ControlPanel(tk.Toplevel):
         same_target_sources = set()
         self._ui(self.log.log, f"Moving: {len(src_paths)} item(s) → {len(drives)} drive(s)", "info")
         for drive_idx, drive_root in drives:
+            check_cancel(cancel)
             panel = self.drive_panels[drive_idx]
             self._ui(panel.set_status, "⏳ Moving...", ORANGE)
             rel = panel.relative_subpath
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
-            os.makedirs(dest_folder, exist_ok=True)
+            os.makedirs(lp(dest_folder), exist_ok=True)
             last_refresh = 0
             for src in src_paths:
+                check_cancel(cancel)
                 if not src:
                     continue
                 name = os.path.basename(src)
                 dest = os.path.join(dest_folder, name)
                 # Moving a folder/file onto itself (source == destination drive/path) — skip copy step
                 try:
-                    same_target = os.path.exists(src) and os.path.exists(dest) and \
-                                  os.path.samefile(src, dest)
+                    same_target = os.path.exists(lp(src)) and os.path.exists(lp(dest)) and \
+                                  os.path.samefile(lp(src), lp(dest))
                 except Exception:
                     same_target = False
                 try:
                     if same_target:
                         same_target_sources.add(src)
                         self._ui(self.log.log, f"↷ {name}: already on Drive {drive_idx+1}, skipping copy", "warn")
-                    elif os.path.isdir(src):
-                        if os.path.exists(dest):
-                            shutil.rmtree(dest)
-                        shutil.copytree(src, dest)
+                    elif os.path.isdir(lp(src)):
+                        if os.path.exists(lp(dest)):
+                            remove_path_cancellable(dest, cancel)
+                        copytree_cancellable(src, dest, cancel)
                         self._ui(self.log.log, f"✔ {name} → Drive {drive_idx+1}", "ok")
                     else:
-                        shutil.copy2(src, dest)
+                        copy_file_cancellable(src, dest, cancel)
                         self._ui(self.log.log, f"✔ {name} → Drive {drive_idx+1}", "ok")
+                except OperationCancelled:
+                    self._ui(self.log.log,
+                             f"⛔ Interrupted while copying {name} → Drive {drive_idx+1}. "
+                             f"Originals were NOT removed.", "warn")
+                    raise
                 except Exception as e:
                     self._ui(self.log.log, f"✘ {name} → Drive {drive_idx+1}: {e}", "err")
                     failed_sources.add(src)
@@ -2229,30 +3056,27 @@ class ControlPanel(tk.Toplevel):
                 )
                 continue
             try:
-                if os.path.isdir(src):
-                    shutil.rmtree(src)
-                else:
-                    os.remove(src)
+                check_cancel(cancel)
+                remove_path_cancellable(src, cancel)
                 removed += 1
                 self._ui(self.log.log, f"✂ Removed source: {os.path.basename(src)}", "warn")
+            except OperationCancelled:
+                self._ui(self.log.log,
+                         f"⛔ Stopped while removing originals (copies on the drives are complete; "
+                         f"{os.path.basename(src)} may be partially removed).", "warn")
+                raise
             except Exception as e:
                 self._ui(self.log.log, f"✘ Could not remove source {os.path.basename(src)}: {e}", "err")
 
-        # Clean up queue/selection, refresh views
+        # Clean up queue/selection
         def _finish_move():
             if hasattr(self, '_queue_items'):
                 self._queue_items = [p for p in self._queue_items if p in failed_sources]
                 self._queue_refresh()
             self._selected_paths = []
-            self.source_tree.refresh()
         self._ui(_finish_move)
-
-        self._ui(self.progress_var.set, 100)
         self._ui(self.log.log, f"Move complete! {removed} item(s) moved.", "ok")
-        self._copying = False
-        self._ui(self.copy_btn.config, state="normal")
-        self._ui(self.move_btn.config, state="normal")
-        self._ui(messagebox.showinfo, "Done", "Move completed successfully!")
+        return ("Done", "Move completed successfully!")
 
     def _delete_selected(self):
         if self._copying:
@@ -2273,31 +3097,32 @@ class ControlPanel(tk.Toplevel):
             msg += f"\n... and {len(names)-8} more"
         if not messagebox.askyesno("Confirm delete", msg):
             return
-        threading.Thread(target=self._do_delete, args=(paths, drives), daemon=True).start()
+        self._start_op(self._do_delete, paths, drives)
 
     def _do_delete(self, paths, drives):
-        # Background thread — was previously run directly on the main
-        # thread (shutil.rmtree()/os.remove() + a blocking refresh()),
-        # which froze the UI for the whole delete and never showed
-        # progress. Now matches the copy/move/sync pattern.
-        self._copying = True
-        self._ui(self.delete_btn.config, state="disabled")
+        # Worker thread (see _do_copy).
+        cancel = self._cur_cancel()
         self._clear_all_drive_statuses()
         for drive_idx, drive_root in drives:
+            check_cancel(cancel)
             panel = self.drive_panels[drive_idx]
             self._ui(panel.set_status, "⏳ Deleting...", ORANGE)
             rel = panel.relative_subpath
             dest_folder = os.path.join(drive_root, rel) if rel else drive_root
             last_refresh = 0
             for src in paths:
+                check_cancel(cancel)
                 name = os.path.basename(src)
                 target = os.path.join(dest_folder, name)
                 try:
-                    if os.path.isdir(target):
-                        shutil.rmtree(target)
-                    elif os.path.isfile(target):
-                        os.remove(target)
-                    self._ui(self.log.log, f"🗑 {name} deleted from Drive {drive_idx+1}", "warn")
+                    if os.path.isdir(lp(target)) or os.path.isfile(lp(target)):
+                        remove_path_cancellable(target, cancel)
+                        self._ui(self.log.log, f"🗑 {name} deleted from Drive {drive_idx+1}", "warn")
+                except OperationCancelled:
+                    self._ui(self.log.log,
+                             f"⛔ Stopped while deleting {name} from Drive {drive_idx+1} "
+                             f"(it may be partially deleted).", "warn")
+                    raise
                 except Exception as e:
                     self._ui(self.log.log, f"✘ Delete error {name}: {e}", "err")
                 now = time.time()
@@ -2306,15 +3131,10 @@ class ControlPanel(tk.Toplevel):
                     last_refresh = now
             self._ui(panel.set_status, "✔ Done", GREEN)
             panel.refresh_async()
-        # Same reasoning as in _do_copy — keep the Control Panel's own
-        # preview in sync if it happens to be pointed at one of the drives.
-        self._ui(self.source_tree.refresh)
-        self._copying = False
-        self._ui(self.delete_btn.config, state="normal")
 
     def _sync_all(self):
         src = self.source_tree.root_path
-        if not src or not os.path.exists(src):
+        if not src or not os.path.exists(lp(src)):
             messagebox.showerror("Error", "No active source folder.")
             return
         drives = self._get_active_drives()
@@ -2328,29 +3148,32 @@ class ControlPanel(tk.Toplevel):
                f"→ {len(drives)} drive(s)\n\nFiles will be OVERWRITTEN!")
         if not messagebox.askyesno("Confirm sync", msg):
             return
-        threading.Thread(target=self._do_sync, args=(src, drives, rel), daemon=True).start()
+        self._start_op(self._do_sync, src, drives, rel)
 
     def _do_sync(self, src, drives, rel_subpath):
-        # Background thread — all Tk access goes through self._ui(...).
-        self._copying = True
-        self._ui(self.copy_btn.config, state="disabled")
+        # Worker thread (see _do_copy).
+        cancel = self._cur_cancel()
         self._clear_all_drive_statuses()
         self._ui(self.log.log, f"Syncing: {src} → {len(drives)} drive(s)", "info")
         for drive_idx, drive_root in drives:
+            check_cancel(cancel)
             panel = self.drive_panels[drive_idx]
             self._ui(panel.set_status, "⏳ Syncing...", ORANGE)
             dest_folder = os.path.join(drive_root, rel_subpath) if rel_subpath else drive_root
             try:
-                os.makedirs(dest_folder, exist_ok=True)
+                os.makedirs(lp(dest_folder), exist_ok=True)
                 last_refresh = 0
-                for item in os.scandir(src):
+                with os.scandir(lp(src)) as it:
+                    items = list(it)
+                for item in items:
+                    check_cancel(cancel)
                     dest = os.path.join(dest_folder, item.name)
                     if item.is_dir():
-                        if os.path.exists(dest):
-                            shutil.rmtree(dest)
-                        shutil.copytree(item.path, dest)
+                        if os.path.exists(lp(dest)):
+                            remove_path_cancellable(dest, cancel)
+                        copytree_cancellable(os.path.join(src, item.name), dest, cancel)
                     else:
-                        shutil.copy2(item.path, dest)
+                        copy_file_cancellable(os.path.join(src, item.name), dest, cancel)
                     self._ui(self.log.log, f"✔ {item.name} → Drive {drive_idx+1}", "ok")
                     now = time.time()
                     if now - last_refresh > 0.75:
@@ -2358,15 +3181,15 @@ class ControlPanel(tk.Toplevel):
                         last_refresh = now
                 self._ui(panel.set_status, "✔ Synced", GREEN)
                 panel.refresh_async()
+            except OperationCancelled:
+                self._ui(self.log.log,
+                         f"⛔ Sync to Drive {drive_idx+1} interrupted "
+                         f"(an incomplete item may remain there).", "warn")
+                raise
             except Exception as e:
                 self._ui(self.log.log, f"✘ Drive {drive_idx+1}: {e}", "err")
                 self._ui(panel.set_status, "✘ Error", RED)
-        # Same reasoning as in _do_copy — keep the Control Panel's own
-        # preview in sync if it happens to be pointed at one of the drives.
-        self._ui(self.source_tree.refresh)
         self._ui(self.log.log, "Sync complete!", "ok")
-        self._copying = False
-        self._ui(self.copy_btn.config, state="normal")
 
     # ══════════════════════════════════════════
     # SAFE EJECT
